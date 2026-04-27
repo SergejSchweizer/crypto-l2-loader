@@ -7,7 +7,13 @@ from datetime import timezone
 import pytest
 
 from ingestion.exchanges import deribit
-from ingestion.spot import fetch_binance_spot_candles, fetch_candles, normalize_timeframe, parse_kline
+from ingestion.spot import (
+    fetch_binance_spot_candles,
+    fetch_candles,
+    fetch_candles_all_history,
+    normalize_timeframe,
+    parse_kline,
+)
 
 
 
@@ -143,3 +149,29 @@ def test_fetch_deribit_candles_respects_limit(monkeypatch: pytest.MonkeyPatch) -
     candles = fetch_candles(exchange="deribit", market="perp", symbol="BTC", interval="1m", limit=3)
     assert len(candles) == 3
     assert [int(item.open_time.timestamp()) for item in candles] == [2, 3, 4]
+
+
+def test_fetch_all_history_routes_to_exchange_all_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ingestion.exchanges import deribit as deribit_exchange
+
+    def fake_get_json(url: str, params: dict[str, object] | None = None, timeout_s: float = 15.0) -> object:
+        del url, timeout_s, params
+        return {
+            "result": {
+                "status": "ok",
+                "ticks": [1000, 2000, 3000],
+                "open": [1, 2, 3],
+                "high": [1, 2, 3],
+                "low": [1, 2, 3],
+                "close": [1, 2, 3],
+                "volume": [1, 2, 3],
+            }
+        }
+
+    monkeypatch.setattr(deribit_exchange, "DERIBIT_MAX_POINTS_PER_REQUEST", 5000)
+    monkeypatch.setattr(deribit_exchange, "_utc_now_ms", lambda: 10_000)
+    monkeypatch.setattr(deribit_exchange, "get_json", fake_get_json)
+
+    candles = fetch_candles_all_history(exchange="deribit", market="spot", symbol="BTCUSDT", interval="1m")
+    assert len(candles) == 3
+    assert [int(item.open_time.timestamp()) for item in candles] == [1, 2, 3]

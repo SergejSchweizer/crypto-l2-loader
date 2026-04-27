@@ -11,7 +11,7 @@ from typing import DefaultDict
 from ingestion.spot import SpotCandle
 
 DatasetType = str
-PartitionKey = tuple[str, str, str, str]
+PartitionKey = tuple[str, str, str]
 NaturalKey = tuple[str, str, str, datetime]
 
 
@@ -24,13 +24,12 @@ def utc_run_id() -> str:
 
 
 def candle_partition_key(candle: SpotCandle) -> PartitionKey:
-    """Build partition key as exchange/symbol/timeframe/date."""
+    """Build partition key as exchange/symbol/timeframe."""
 
     return (
         candle.exchange,
         candle.symbol,
         candle.interval,
-        candle.open_time.strftime("%Y-%m-%d"),
     )
 
 
@@ -38,14 +37,13 @@ def candle_partition_key(candle: SpotCandle) -> PartitionKey:
 def partition_path(lake_root: str, dataset_type: DatasetType, key: PartitionKey) -> Path:
     """Return destination path for one parquet partition."""
 
-    exchange, symbol, timeframe, date_str = key
+    exchange, symbol, timeframe = key
     return (
         Path(lake_root)
         / f"dataset_type={dataset_type}"
         / f"exchange={exchange}"
         / f"symbol={symbol}"
         / f"timeframe={timeframe}"
-        / f"date={date_str}"
     )
 
 
@@ -99,6 +97,74 @@ def merge_and_deduplicate_rows(existing: list[dict[str, object]], new: list[dict
     rows = list(merged.values())
     rows.sort(key=lambda item: item["open_time"])
     return rows
+
+
+def latest_open_time_in_lake(
+    lake_root: str,
+    market: str,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+) -> datetime | None:
+    """Return latest stored open_time for one instrument/timeframe parquet file, if present."""
+
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required for parquet lake output. Install project dependencies.") from exc
+
+    dataset_type = "spot_ohlcv" if market == "spot" else "perp_ohlcv"
+    base = (
+        Path(lake_root)
+        / f"dataset_type={dataset_type}"
+        / f"exchange={exchange}"
+        / f"symbol={symbol}"
+        / f"timeframe={timeframe}"
+    )
+    if not base.exists():
+        return None
+
+    data_file = base / "data.parquet"
+    if not data_file.exists():
+        return None
+
+    latest: datetime | None = None
+    table = pq.ParquetFile(data_file).read(columns=["open_time"])
+    for value in table.column("open_time").to_pylist():
+        if isinstance(value, datetime) and (latest is None or value > latest):
+            latest = value
+    return latest
+
+
+def open_times_in_lake(
+    lake_root: str,
+    market: str,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+) -> list[datetime]:
+    """Return all stored open_time values for one instrument/timeframe parquet file."""
+
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required for parquet lake output. Install project dependencies.") from exc
+
+    dataset_type = "spot_ohlcv" if market == "spot" else "perp_ohlcv"
+    data_file = (
+        Path(lake_root)
+        / f"dataset_type={dataset_type}"
+        / f"exchange={exchange}"
+        / f"symbol={symbol}"
+        / f"timeframe={timeframe}"
+        / "data.parquet"
+    )
+    if not data_file.exists():
+        return []
+
+    table = pq.ParquetFile(data_file).read(columns=["open_time"])
+    values = [value for value in table.column("open_time").to_pylist() if isinstance(value, datetime)]
+    return sorted(set(values))
 
 
 def save_spot_candles_parquet_lake(

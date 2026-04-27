@@ -35,6 +35,32 @@ def list_supported_intervals() -> tuple[str, ...]:
 
 
 
+def max_limit() -> int:
+    """Return max kline points Binance allows per single request."""
+
+    return BINANCE_MAX_KLINES_PER_REQUEST
+
+
+
+def interval_to_milliseconds(interval: str) -> int:
+    """Convert normalized Binance interval to milliseconds."""
+
+    if interval.endswith("s"):
+        return int(interval[:-1]) * 1_000
+    if interval.endswith("m"):
+        return int(interval[:-1]) * 60_000
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 3_600_000
+    if interval.endswith("d"):
+        return int(interval[:-1]) * 86_400_000
+    if interval.endswith("w"):
+        return int(interval[:-1]) * 7 * 86_400_000
+    if interval.endswith("M"):
+        raise ValueError("Monthly interval is not supported for gap-fill mode. Use --limit with 1M.")
+    raise ValueError(f"Unsupported interval '{interval}'")
+
+
+
 def normalize_timeframe(value: str) -> str:
     """Normalize user-provided timeframe aliases into Binance interval format."""
 
@@ -100,6 +126,80 @@ def fetch_klines(symbol: str, interval: str, limit: int) -> list[list[object]]:
 
 
 
+def fetch_klines_all(symbol: str, interval: str) -> list[list[object]]:
+    """Fetch all available Binance klines by paging backward until exhaustion."""
+
+    end_time_ms: int | None = None
+    pages: list[list[list[object]]] = []
+
+    while True:
+        page = _fetch_klines_page(
+            symbol=symbol,
+            interval=interval,
+            limit=BINANCE_MAX_KLINES_PER_REQUEST,
+            end_time_ms=end_time_ms,
+        )
+        if not page:
+            break
+
+        pages.append(page)
+        earliest_open_time_ms = _extract_open_time_ms(page[0])
+        next_end_time_ms = earliest_open_time_ms - 1
+        if next_end_time_ms < 0:
+            break
+        if end_time_ms is not None and next_end_time_ms >= end_time_ms:
+            break
+        end_time_ms = next_end_time_ms
+
+        if len(page) < BINANCE_MAX_KLINES_PER_REQUEST:
+            break
+
+    rows = [row for page in reversed(pages) for row in page]
+    dedup: dict[int, list[object]] = {}
+    for row in rows:
+        dedup[_extract_open_time_ms(row)] = row
+    return [dedup[key] for key in sorted(dedup)]
+
+
+def fetch_klines_range(symbol: str, interval: str, start_open_ms: int, end_open_ms: int) -> list[list[object]]:
+    """Fetch Binance klines in a forward time range inclusive by open time."""
+
+    if end_open_ms < start_open_ms:
+        return []
+
+    interval_ms = interval_to_milliseconds(interval)
+    cursor = start_open_ms
+    rows: list[list[object]] = []
+
+    while cursor <= end_open_ms:
+        page = _fetch_klines_page(
+            symbol=symbol,
+            interval=interval,
+            limit=BINANCE_MAX_KLINES_PER_REQUEST,
+            start_time_ms=cursor,
+            end_time_ms=end_open_ms + interval_ms - 1,
+        )
+        if not page:
+            break
+
+        filtered = [row for row in page if _extract_open_time_ms(row) <= end_open_ms]
+        rows.extend(filtered)
+
+        last_open_ms = _extract_open_time_ms(page[-1])
+        if last_open_ms < cursor:
+            break
+        cursor = last_open_ms + interval_ms
+
+        if len(page) < BINANCE_MAX_KLINES_PER_REQUEST:
+            break
+
+    dedup: dict[int, list[object]] = {}
+    for row in rows:
+        dedup[_extract_open_time_ms(row)] = row
+    return [dedup[key] for key in sorted(dedup)]
+
+
+
 def _extract_open_time_ms(row: list[object]) -> int:
     """Return kline open time in milliseconds."""
 
@@ -107,10 +207,18 @@ def _extract_open_time_ms(row: list[object]) -> int:
 
 
 
-def _fetch_klines_page(symbol: str, interval: str, limit: int, end_time_ms: int | None) -> list[list[object]]:
+def _fetch_klines_page(
+    symbol: str,
+    interval: str,
+    limit: int,
+    end_time_ms: int | None,
+    start_time_ms: int | None = None,
+) -> list[list[object]]:
     """Fetch one page of klines from Binance."""
 
     params: dict[str, Any] = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    if start_time_ms is not None:
+        params["startTime"] = start_time_ms
     if end_time_ms is not None:
         params["endTime"] = end_time_ms
 

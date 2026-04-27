@@ -32,6 +32,13 @@ def list_supported_intervals() -> tuple[str, ...]:
 
 
 
+def max_limit() -> int:
+    """Return max chart points Deribit allows per request window."""
+
+    return DERIBIT_MAX_POINTS_PER_REQUEST
+
+
+
 def normalize_timeframe(value: str) -> str:
     """Normalize user-provided timeframe aliases into Deribit interval format."""
 
@@ -76,6 +83,19 @@ def to_deribit_resolution(interval: str) -> str:
 
 
 
+def interval_to_milliseconds(interval: str) -> int:
+    """Convert normalized interval into milliseconds."""
+
+    if interval.endswith("m"):
+        return int(interval[:-1]) * 60_000
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 3_600_000
+    if interval == "1d":
+        return 86_400_000
+    raise ValueError(f"Unsupported interval '{interval}'")
+
+
+
 def normalize_symbol(symbol: str, market: str) -> str:
     """Normalize user symbols for Deribit spot/perpetual markets."""
 
@@ -113,7 +133,7 @@ def fetch_klines(symbol: str, market: str, interval: str, limit: int) -> list[li
     instrument_name = normalize_symbol(symbol=symbol, market=market)
     resolution = to_deribit_resolution(interval)
     now_ms = _utc_now_ms()
-    window_ms = _interval_ms(interval)
+    window_ms = interval_to_milliseconds(interval)
 
     remaining = limit
     end_time_ms = now_ms
@@ -149,23 +169,100 @@ def fetch_klines(symbol: str, market: str, interval: str, limit: int) -> list[li
 
 
 
+def fetch_klines_all(symbol: str, market: str, interval: str) -> list[list[object]]:
+    """Fetch all available Deribit candles by paging backward until exhaustion."""
+
+    instrument_name = normalize_symbol(symbol=symbol, market=market)
+    resolution = to_deribit_resolution(interval)
+    now_ms = _utc_now_ms()
+    window_ms = interval_to_milliseconds(interval)
+
+    end_time_ms = now_ms
+    pages: list[list[list[object]]] = []
+
+    while True:
+        start_time_ms = end_time_ms - (DERIBIT_MAX_POINTS_PER_REQUEST * window_ms)
+        page = _fetch_chart_page(
+            instrument_name=instrument_name,
+            resolution=resolution,
+            candle_width_ms=window_ms,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
+        if not page:
+            break
+
+        pages.append(page)
+        earliest_tick_ms = _extract_open_time_ms(page[0])
+        next_end_time_ms = earliest_tick_ms - 1
+        if next_end_time_ms < 0:
+            break
+        if next_end_time_ms >= end_time_ms:
+            break
+        end_time_ms = next_end_time_ms
+
+        if len(page) < DERIBIT_MAX_POINTS_PER_REQUEST:
+            break
+
+    rows = [row for page in reversed(pages) for row in page]
+    dedup: dict[int, list[object]] = {}
+    for row in rows:
+        dedup[_extract_open_time_ms(row)] = row
+    return [dedup[key] for key in sorted(dedup)]
+
+
+def fetch_klines_range(
+    symbol: str,
+    market: str,
+    interval: str,
+    start_open_ms: int,
+    end_open_ms: int,
+) -> list[list[object]]:
+    """Fetch Deribit candles in a forward open-time range."""
+
+    if end_open_ms < start_open_ms:
+        return []
+
+    instrument_name = normalize_symbol(symbol=symbol, market=market)
+    resolution = to_deribit_resolution(interval)
+    interval_ms = interval_to_milliseconds(interval)
+
+    cursor = start_open_ms
+    rows: list[list[object]] = []
+
+    while cursor <= end_open_ms:
+        window_end_ms = min(
+            end_open_ms + interval_ms - 1,
+            cursor + (DERIBIT_MAX_POINTS_PER_REQUEST * interval_ms) - 1,
+        )
+
+        page = _fetch_chart_page(
+            instrument_name=instrument_name,
+            resolution=resolution,
+            candle_width_ms=interval_ms,
+            start_time_ms=cursor,
+            end_time_ms=window_end_ms,
+        )
+
+        if page:
+            filtered = [row for row in page if start_open_ms <= _extract_open_time_ms(row) <= end_open_ms]
+            rows.extend(filtered)
+            last_open_ms = _extract_open_time_ms(page[-1])
+            cursor = max(window_end_ms + 1, last_open_ms + interval_ms)
+        else:
+            cursor = window_end_ms + 1
+
+    dedup: dict[int, list[object]] = {}
+    for row in rows:
+        dedup[_extract_open_time_ms(row)] = row
+    return [dedup[key] for key in sorted(dedup)]
+
+
+
 def _utc_now_ms() -> int:
     """Return current UTC time in milliseconds."""
 
     return int(datetime.now(timezone.utc).timestamp() * 1000)
-
-
-
-def _interval_ms(interval: str) -> int:
-    """Convert normalized interval into milliseconds."""
-
-    if interval.endswith("m"):
-        return int(interval[:-1]) * 60_000
-    if interval.endswith("h"):
-        return int(interval[:-1]) * 3_600_000
-    if interval == "1d":
-        return 86_400_000
-    raise ValueError(f"Unsupported interval '{interval}'")
 
 
 
@@ -177,7 +274,11 @@ def _extract_open_time_ms(row: list[object]) -> int:
 
 
 def _fetch_chart_page(
-    instrument_name: str, resolution: str, candle_width_ms: int, start_time_ms: int, end_time_ms: int
+    instrument_name: str,
+    resolution: str,
+    candle_width_ms: int,
+    start_time_ms: int,
+    end_time_ms: int,
 ) -> list[list[object]]:
     """Fetch one chart-data page from Deribit and map to common row layout."""
 
@@ -213,7 +314,6 @@ def _fetch_chart_page(
     for ts, open_price, high_price, low_price, close_price, volume in zip(
         ticks, opens, highs, lows, closes, volumes, strict=True
     ):
-        # Keep row shape aligned with Binance parser expectations for shared serialization path.
         close_ts = int(ts) + candle_width_ms - 1
         rows.append(
             [

@@ -60,7 +60,9 @@ def save_candle_plots(
     """
 
     try:
+        import matplotlib.dates as mdates
         import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
     except ImportError as exc:
         raise RuntimeError("matplotlib is required for plotting. Install project dependencies first.") from exc
 
@@ -85,16 +87,39 @@ def save_candle_plots(
                 sharex=True,
                 gridspec_kw={"height_ratios": [7, 3]},
             )
+            figure.patch.set_facecolor("#f7f9fc")
 
-            price_axis.plot(times, prices, color="#006d77", linewidth=1.5)
-            price_axis.set_ylabel(f"{price_field} price")
-            price_axis.grid(alpha=0.3)
-            price_axis.set_title(f"{exchange.upper()} {symbol} ({interval})")
+            for axis in (price_axis, volume_axis):
+                axis.set_facecolor("#fdfefe")
+                axis.grid(alpha=0.2, linestyle="--", linewidth=0.8, color="#8aa0b5")
+                axis.spines["top"].set_visible(False)
+                axis.spines["right"].set_visible(False)
+                axis.spines["left"].set_color("#8aa0b5")
+                axis.spines["bottom"].set_color("#8aa0b5")
 
-            volume_axis.bar(times, volumes, color="#0b1f5e", width=0.004)
-            volume_axis.set_ylabel("volume")
-            volume_axis.grid(alpha=0.3)
-            volume_axis.set_xlabel("time (UTC)")
+            price_axis.plot(times, prices, color="#3a86ff", linewidth=4.0, alpha=0.15)
+            price_axis.plot(times, prices, color="#1d4ed8", linewidth=2.2)
+            price_axis.fill_between(times, prices, min(prices), color="#60a5fa", alpha=0.12)
+            price_axis.set_ylabel(f"{price_field} price", color="#334155")
+            price_axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+            price_axis.set_title(
+                f"{exchange.upper()}  {symbol}  ({interval})",
+                fontsize=13,
+                fontweight="semibold",
+                color="#0f172a",
+                pad=10,
+            )
+
+            volume_colors = ["#16a34a"]
+            volume_colors.extend(
+                "#16a34a" if current >= previous else "#dc2626"
+                for previous, current in zip(prices, prices[1:])
+            )
+            volume_axis.bar(times, volumes, color=volume_colors, width=0.004, alpha=0.75)
+            volume_axis.set_ylabel("volume", color="#334155")
+            volume_axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.0f}"))
+            volume_axis.set_xlabel("time (UTC)", color="#334155")
+            volume_axis.xaxis.set_major_formatter(mdates.DateFormatter("%m.%Y"))
 
             figure.autofmt_xdate()
             figure.tight_layout()
@@ -107,7 +132,7 @@ def save_candle_plots(
             )
             file_path = plot_root / file_name
 
-            figure.savefig(file_path, dpi=150)
+            figure.savefig(file_path, dpi=180)
             plt.close(figure)
             saved_paths.append(str(file_path.resolve()))
 

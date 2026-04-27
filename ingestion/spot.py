@@ -14,22 +14,7 @@ Market = Literal["spot", "perp"]
 
 @dataclass(frozen=True)
 class SpotCandle:
-    """OHLCV candle for an instrument.
-
-    Attributes:
-        exchange: Exchange identifier.
-        symbol: Instrument symbol.
-        interval: Candle interval string accepted by the exchange.
-        open_time: Candle open timestamp (UTC).
-        close_time: Candle close timestamp (UTC).
-        open_price: Open price.
-        high_price: High price.
-        low_price: Low price.
-        close_price: Close price.
-        volume: Base asset volume.
-        quote_volume: Quote asset volume if available.
-        trade_count: Number of trades if available.
-    """
+    """OHLCV candle for an instrument."""
 
     exchange: str
     symbol: str
@@ -95,6 +80,41 @@ def normalize_timeframe(exchange: Exchange, value: str) -> str:
 
 
 
+def max_candles_per_request(exchange: Exchange) -> int:
+    """Return max single-request candle count for exchange."""
+
+    if exchange == "binance":
+        return binance.max_limit()
+    if exchange == "deribit":
+        return deribit.max_limit()
+    raise ValueError(f"Unsupported exchange '{exchange}'")
+
+
+
+def interval_to_milliseconds(exchange: Exchange, interval: str) -> int:
+    """Convert normalized interval into milliseconds for exchange."""
+
+    if exchange == "binance":
+        return binance.interval_to_milliseconds(interval)
+    if exchange == "deribit":
+        return deribit.interval_to_milliseconds(interval)
+    raise ValueError(f"Unsupported exchange '{exchange}'")
+
+
+
+def normalize_storage_symbol(exchange: Exchange, symbol: str, market: Market) -> str:
+    """Normalize symbol to storage form for selected exchange/market."""
+
+    if exchange == "binance":
+        if market != "spot":
+            raise ValueError("Binance adapter currently supports spot candles only")
+        return symbol.upper()
+    if exchange == "deribit":
+        return deribit.normalize_symbol(symbol=symbol, market=market)
+    raise ValueError(f"Unsupported exchange '{exchange}'")
+
+
+
 def fetch_candles(
     exchange: Exchange,
     symbol: str,
@@ -102,23 +122,13 @@ def fetch_candles(
     limit: int = 100,
     market: Market = "spot",
 ) -> list[SpotCandle]:
-    """Fetch candles from supported exchanges.
-
-    Args:
-        exchange: Exchange name.
-        symbol: Symbol or instrument alias.
-        interval: User interval (aliases accepted).
-        limit: Number of candles to fetch.
-        market: Market type for exchanges that distinguish spot/perp symbols.
-    """
+    """Fetch latest candles from supported exchanges."""
 
     normalized_interval = normalize_timeframe(exchange=exchange, value=interval)
+    normalized_symbol = normalize_storage_symbol(exchange=exchange, symbol=symbol, market=market)
 
     if exchange == "binance":
-        if market != "spot":
-            raise ValueError("Binance adapter currently supports spot candles only")
         rows = binance.fetch_klines(symbol=symbol, interval=normalized_interval, limit=limit)
-        normalized_symbol = symbol.upper()
     elif exchange == "deribit":
         rows = deribit.fetch_klines(
             symbol=symbol,
@@ -126,11 +136,79 @@ def fetch_candles(
             interval=normalized_interval,
             limit=limit,
         )
-        normalized_symbol = deribit.normalize_symbol(symbol=symbol, market=market)
     else:
         raise ValueError(f"Unsupported exchange '{exchange}'")
 
-    return [parse_kline(exchange=exchange, symbol=normalized_symbol, interval=normalized_interval, row=row) for row in rows]
+    return [
+        parse_kline(exchange=exchange, symbol=normalized_symbol, interval=normalized_interval, row=row)
+        for row in rows
+    ]
+
+
+
+def fetch_candles_all_history(
+    exchange: Exchange,
+    symbol: str,
+    interval: str = "1h",
+    market: Market = "spot",
+) -> list[SpotCandle]:
+    """Fetch all available candles from exchange history."""
+
+    normalized_interval = normalize_timeframe(exchange=exchange, value=interval)
+    normalized_symbol = normalize_storage_symbol(exchange=exchange, symbol=symbol, market=market)
+
+    if exchange == "binance":
+        rows = binance.fetch_klines_all(symbol=symbol, interval=normalized_interval)
+    elif exchange == "deribit":
+        rows = deribit.fetch_klines_all(
+            symbol=symbol,
+            market=market,
+            interval=normalized_interval,
+        )
+    else:
+        raise ValueError(f"Unsupported exchange '{exchange}'")
+
+    return [
+        parse_kline(exchange=exchange, symbol=normalized_symbol, interval=normalized_interval, row=row)
+        for row in rows
+    ]
+
+
+def fetch_candles_range(
+    exchange: Exchange,
+    symbol: str,
+    interval: str,
+    start_open_ms: int,
+    end_open_ms: int,
+    market: Market = "spot",
+) -> list[SpotCandle]:
+    """Fetch candles by open-time range inclusive."""
+
+    normalized_interval = normalize_timeframe(exchange=exchange, value=interval)
+    normalized_symbol = normalize_storage_symbol(exchange=exchange, symbol=symbol, market=market)
+
+    if exchange == "binance":
+        rows = binance.fetch_klines_range(
+            symbol=symbol,
+            interval=normalized_interval,
+            start_open_ms=start_open_ms,
+            end_open_ms=end_open_ms,
+        )
+    elif exchange == "deribit":
+        rows = deribit.fetch_klines_range(
+            symbol=symbol,
+            market=market,
+            interval=normalized_interval,
+            start_open_ms=start_open_ms,
+            end_open_ms=end_open_ms,
+        )
+    else:
+        raise ValueError(f"Unsupported exchange '{exchange}'")
+
+    return [
+        parse_kline(exchange=exchange, symbol=normalized_symbol, interval=normalized_interval, row=row)
+        for row in rows
+    ]
 
 
 

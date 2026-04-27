@@ -74,6 +74,26 @@ python3 main.py fetch-spot --exchanges binance deribit --market spot --symbols B
 
 Parquet lake write mode uses a stable file per partition (`data.parquet`) with staged merge+rewrite on each run to keep file counts bounded.
 
+Fetch all available history from exchanges (can be long-running):
+
+```bash
+python3 main.py fetch-spot --exchanges binance deribit --market spot --symbols BTCUSDT ETHUSDT --timeframe M1 --all-history --save-parquet-lake --lake-root lake/bronze --no-json-output
+```
+
+Run gap-fill mode (default when `--limit` is omitted): detects and fills all missing candles within stored history and also backfills from latest stored candle to current closed candle.
+
+```bash
+python3 main.py fetch-spot --exchange binance --market spot --symbols BTCUSDT ETHUSDT --timeframe H1 --save-parquet-lake --lake-root lake/bronze
+```
+
+If no parquet data exists and `--limit` is omitted, the script bootstraps with the maximum single-request amount supported by the exchange/timeframe.
+
+Use explicit latest mode without a fixed count:
+
+```bash
+python3 main.py fetch-spot --exchange deribit --market perp --symbols BTC ETH --timeframe M5 --mode latest
+```
+
 Run silently without JSON output:
 
 ```bash
@@ -100,7 +120,27 @@ python3 main.py list-spot-timeframes --exchange deribit
 python3 main.py list-spot-timeframes --exchanges binance deribit
 ```
 
-## 7. Testing Instructions
+## 7. Example Plots
+
+The following plots are versioned under `docs/figures/plot_outputs/` and generated from CLI output candles.
+
+### Figure 1. Binance BTCUSDT (M1 close)
+
+![Figure 1 - Binance BTCUSDT M1 close](docs/figures/plot_outputs/binance_BTCUSDT_1m_close.png)
+
+### Figure 2. Binance ETHUSDT (M1 close)
+
+![Figure 2 - Binance ETHUSDT M1 close](docs/figures/plot_outputs/binance_ETHUSDT_1m_close.png)
+
+### Figure 3. Deribit BTCUSDT alias -> BTC_USDC (M1 close)
+
+![Figure 3 - Deribit BTCUSDT M1 close](docs/figures/plot_outputs/deribit_BTCUSDT_1m_close.png)
+
+### Figure 4. Deribit ETHUSDT alias -> ETH_USDC (M1 close)
+
+![Figure 4 - Deribit ETHUSDT M1 close](docs/figures/plot_outputs/deribit_ETHUSDT_1m_close.png)
+
+## 8. Testing Instructions
 
 ```bash
 pytest
@@ -108,19 +148,49 @@ ruff check .
 mypy .
 ```
 
-## 8. Deployment Instructions
+## 9. Deployment Instructions
 
 - For now this is a local CLI tool.
 - Next stage will add scheduled runs and database persistence.
 - The CLI enforces a single running instance using `.run/l2-synchronizer.lock`.
 
-## 9. Known Limitations
+### 9.1 TimescaleDB via Docker Compose
+
+1. Copy environment template:
+
+```bash
+cp docker/.env.example docker/.env
+```
+
+2. Start TimescaleDB:
+
+```bash
+docker compose -f docker/docker-compose.timescaledb.yml --env-file docker/.env up -d
+```
+
+3. Check service health:
+
+```bash
+docker compose -f docker/docker-compose.timescaledb.yml ps
+```
+
+4. Stop service:
+
+```bash
+docker compose -f docker/docker-compose.timescaledb.yml down
+```
+
+Notes:
+- Data persists in named volume `timescaledb_data`.
+- `infra/db/init/001_enable_timescaledb.sql` auto-runs on first initialization.
+
+## 10. Known Limitations
 
 - Step 1 currently supports candles only (no funding or L2 yet).
 - No database persistence yet.
 - No exchange failover yet.
 
-## 10. Future Improvements
+## 11. Future Improvements
 
 - Add perpetual and funding endpoints.
 - Add Deribit adapter for L2 order book snapshots.

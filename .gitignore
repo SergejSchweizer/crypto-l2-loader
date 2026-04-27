@@ -13,3 +13,4 @@ lake/
 plots/
 .run/
 lake_test/
+.env

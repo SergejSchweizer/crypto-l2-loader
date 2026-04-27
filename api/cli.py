@@ -7,19 +7,27 @@ import fcntl
 import json
 import os
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
-from ingestion.lake import save_spot_candles_parquet_lake
+from ingestion.lake import open_times_in_lake, save_spot_candles_parquet_lake
 from ingestion.plotting import PriceField, save_candle_plots
 from ingestion.spot import (
     Exchange,
+    Market,
     SpotCandle,
     fetch_candles,
+    fetch_candles_all_history,
+    fetch_candles_range,
+    interval_to_milliseconds,
     list_supported_intervals,
+    max_candles_per_request,
+    normalize_storage_symbol,
     normalize_timeframe,
 )
+
+FetchMode = Literal["latest", "gap-fill"]
 
 
 class SingleInstanceError(RuntimeError):
@@ -69,6 +77,128 @@ def _serialize_candle(candle: SpotCandle) -> dict[str, object]:
 
 
 
+def _last_closed_open_ms(interval_ms: int, now_utc: datetime | None = None) -> int:
+    """Return open timestamp (ms) of latest fully closed candle."""
+
+    now = now_utc or datetime.now(timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+    return ((now_ms // interval_ms) - 1) * interval_ms
+
+
+def _missing_ranges_ms(
+    existing_open_times: list[datetime],
+    interval_ms: int,
+    end_open_ms: int,
+) -> list[tuple[int, int]]:
+    """Build contiguous missing open-time ranges from known candles to end-open timestamp."""
+
+    existing_ms = sorted(
+        {
+            int(item.timestamp() * 1000)
+            for item in existing_open_times
+            if item.tzinfo is not None and int(item.timestamp() * 1000) <= end_open_ms
+        }
+    )
+    if not existing_ms:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    for previous, current in zip(existing_ms, existing_ms[1:]):
+        gap_start_ms = previous + interval_ms
+        gap_end_ms = current - interval_ms
+        if gap_start_ms <= gap_end_ms:
+            ranges.append((gap_start_ms, gap_end_ms))
+
+    last_existing_ms = existing_ms[-1]
+    if last_existing_ms + interval_ms <= end_open_ms:
+        ranges.append((last_existing_ms + interval_ms, end_open_ms))
+
+    return ranges
+
+
+
+def _fetch_symbol_candles(
+    exchange: Exchange,
+    market: Market,
+    symbol: str,
+    timeframe: str,
+    limit: int | None,
+    all_history: bool,
+    mode: FetchMode,
+    lake_root: str,
+) -> list[SpotCandle]:
+    """Fetch candles for one symbol using latest/gap-fill logic."""
+
+    if all_history:
+        return fetch_candles_all_history(
+            exchange=exchange,
+            symbol=symbol,
+            interval=timeframe,
+            market=market,
+        )
+
+    if limit is not None:
+        return fetch_candles(exchange=exchange, symbol=symbol, interval=timeframe, limit=limit, market=market)
+
+    if mode == "latest":
+        bootstrap_limit = max_candles_per_request(exchange)
+        return fetch_candles(
+            exchange=exchange,
+            symbol=symbol,
+            interval=timeframe,
+            limit=bootstrap_limit,
+            market=market,
+        )
+
+    storage_symbol = normalize_storage_symbol(exchange=exchange, symbol=symbol, market=market)
+    stored_open_times = open_times_in_lake(
+        lake_root=lake_root,
+        market=market,
+        exchange=exchange,
+        symbol=storage_symbol,
+        timeframe=timeframe,
+    )
+
+    interval_ms = interval_to_milliseconds(exchange=exchange, interval=timeframe)
+    end_open_ms = _last_closed_open_ms(interval_ms=interval_ms)
+    if not stored_open_times:
+        bootstrap_limit = max_candles_per_request(exchange)
+        return fetch_candles(
+            exchange=exchange,
+            symbol=symbol,
+            interval=timeframe,
+            limit=bootstrap_limit,
+            market=market,
+        )
+    if end_open_ms < int(min(stored_open_times).timestamp() * 1000):
+        return []
+
+    missing_ranges = _missing_ranges_ms(
+        existing_open_times=stored_open_times,
+        interval_ms=interval_ms,
+        end_open_ms=end_open_ms,
+    )
+    if not missing_ranges:
+        return []
+
+    fetched: list[SpotCandle] = []
+    for start_open_ms, gap_end_ms in missing_ranges:
+        fetched.extend(
+            fetch_candles_range(
+                exchange=exchange,
+                symbol=symbol,
+                interval=timeframe,
+                start_open_ms=start_open_ms,
+                end_open_ms=gap_end_ms,
+                market=market,
+            )
+        )
+
+    unique_by_open_time = {item.open_time: item for item in fetched}
+    return [unique_by_open_time[key] for key in sorted(unique_by_open_time)]
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create top-level CLI parser."""
 
@@ -100,8 +230,19 @@ def build_parser() -> argparse.ArgumentParser:
     spot_parser.add_argument(
         "--limit",
         type=int,
-        default=10,
-        help="Number of candles per symbol (auto-paginates above 1000)",
+        default=None,
+        help="Optional latest-candle count. If omitted, gap-fill mode is used by default unless --all-history is set.",
+    )
+    spot_parser.add_argument(
+        "--all-history",
+        action="store_true",
+        help="Fetch all available exchange history for each instrument/timeframe.",
+    )
+    spot_parser.add_argument(
+        "--mode",
+        choices=["latest", "gap-fill"],
+        default="gap-fill",
+        help="Fetch behavior when --limit is omitted.",
     )
     spot_parser.add_argument("--plot", action="store_true", help="Create and save price/volume plots")
     spot_parser.add_argument("--plot-dir", default="plots", help="Output directory for generated plots")
@@ -149,9 +290,20 @@ def main() -> None:
             args = parser.parse_args()
 
             if args.command == "fetch-spot":
+                if args.all_history and args.limit is not None:
+                    parser.error("--all-history cannot be combined with --limit")
                 exchanges = cast(list[Exchange], args.exchanges if args.exchanges else [args.exchange])
-                output: dict[str, object] = {}
+                mode = cast(FetchMode, args.mode)
+                market = cast(Market, args.market)
+                if args.all_history:
+                    effective_mode = "all-history"
+                elif args.limit is not None:
+                    effective_mode = "latest-limit"
+                else:
+                    effective_mode = mode
+                output: dict[str, object] = {"_effective_mode": effective_mode}
                 candles_for_plots: dict[str, dict[str, list[SpotCandle]]] = {}
+
                 for exchange in exchanges:
                     exchange_output: dict[str, object] = {}
                     exchange_candles: dict[str, list[SpotCandle]] = {}
@@ -159,12 +311,15 @@ def main() -> None:
                         timeframe = normalize_timeframe(exchange=exchange, value=args.timeframe)
                         for symbol in args.symbols:
                             try:
-                                candles = fetch_candles(
+                                candles = _fetch_symbol_candles(
                                     exchange=exchange,
+                                    market=market,
                                     symbol=symbol,
-                                    interval=timeframe,
+                                    timeframe=timeframe,
                                     limit=args.limit,
-                                    market=args.market,
+                                    all_history=args.all_history,
+                                    mode=mode,
+                                    lake_root=args.lake_root,
                                 )
                                 symbol_key = symbol.upper()
                                 exchange_output[symbol_key] = [_serialize_candle(item) for item in candles]
@@ -173,6 +328,7 @@ def main() -> None:
                                 exchange_output[symbol.upper()] = {"error": str(exc)}
                     except Exception as exc:  # noqa: BLE001
                         exchange_output["_exchange_error"] = str(exc)
+
                     output[exchange] = exchange_output
                     if exchange_candles:
                         candles_for_plots[exchange] = exchange_candles
@@ -192,7 +348,7 @@ def main() -> None:
                     try:
                         parquet_files = save_spot_candles_parquet_lake(
                             candles_by_exchange=candles_for_plots,
-                            market=args.market,
+                            market=market,
                             lake_root=args.lake_root,
                         )
                         output["_parquet_files"] = parquet_files
@@ -201,10 +357,12 @@ def main() -> None:
 
                 if not args.no_json_output:
                     print(json.dumps(output, indent=2))
+
             elif args.command == "list-spot-timeframes":
                 exchanges = cast(list[Exchange], args.exchanges if args.exchanges else [args.exchange])
                 output = {exchange: list(list_supported_intervals(exchange=exchange)) for exchange in exchanges}
                 print(json.dumps(output, indent=2))
+
     except SingleInstanceError as exc:
         raise SystemExit(str(exc)) from exc
 
