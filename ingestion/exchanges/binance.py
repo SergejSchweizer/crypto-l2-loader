@@ -93,6 +93,10 @@ def normalize_symbol(symbol: str, market: str) -> str:
 
     upper = symbol.upper()
     if market == "spot":
+        if upper in {"BTC", "BTCUSD", "BTCUSDT"}:
+            return "BTCUSDT"
+        if upper in {"ETH", "ETHUSD", "ETHUSDT"}:
+            return "ETHUSDT"
         return upper
     if market == "perp":
         if upper in {"BTC", "BTCUSDT"}:

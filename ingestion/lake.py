@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+from ingestion.open_interest import OpenInterestPoint
 from ingestion.spot import SpotCandle
 
 DatasetType = str
@@ -76,6 +77,81 @@ def candle_record(candle: SpotCandle, market: str, run_id: str, ingested_at: dat
     }
 
 
+def open_interest_partition_key(item: OpenInterestPoint, market: str) -> PartitionKey:
+    """Build partition key for open-interest records."""
+
+    return (
+        item.exchange,
+        market,
+        item.symbol,
+        item.interval,
+        item.open_time.strftime("%Y-%m"),
+    )
+
+
+def open_interest_record(
+    item: OpenInterestPoint,
+    market: str,
+    run_id: str,
+    ingested_at: datetime,
+) -> dict[str, object]:
+    """Convert open-interest point to parquet-lake row format."""
+
+    return {
+        "schema_version": "v1",
+        "dataset_type": "open_interest",
+        "exchange": item.exchange,
+        "symbol": item.symbol,
+        "instrument_type": market,
+        "event_time": item.open_time,
+        "ingested_at": ingested_at,
+        "run_id": run_id,
+        "source_endpoint": "public_open_interest",
+        "open_time": item.open_time,
+        "close_time": item.close_time,
+        "timeframe": item.interval,
+        "open_interest": item.open_interest,
+        "open_interest_value": item.open_interest_value,
+    }
+
+
+def open_times_in_lake_by_dataset(
+    lake_root: str,
+    dataset_type: str,
+    market: str,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+) -> list[datetime]:
+    """Return stored open_time values for selected dataset/instrument/timeframe."""
+
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required for parquet lake output. Install project dependencies.") from exc
+
+    partition_root = (
+        Path(lake_root)
+        / f"dataset_type={dataset_type}"
+        / f"exchange={exchange}"
+        / f"instrument_type={market}"
+        / f"symbol={symbol}"
+        / f"timeframe={timeframe}"
+    )
+    if not partition_root.exists():
+        return []
+
+    values: list[datetime] = []
+    for data_file in sorted(partition_root.glob("date=*/data.parquet")):
+        parquet_file = pq.ParquetFile(data_file)  # type: ignore[no-untyped-call]
+        for batch in parquet_file.iter_batches(columns=["open_time"], batch_size=10_000):  # type: ignore[no-untyped-call]
+            for row in batch.to_pylist():
+                value = row.get("open_time")
+                if isinstance(value, datetime):
+                    values.append(value)
+    return sorted(set(values))
+
+
 def record_natural_key(record: dict[str, object]) -> NaturalKey:
     """Build natural key for per-partition deduplication."""
 
@@ -119,32 +195,14 @@ def open_times_in_lake(
     Reads parquet files in batches to keep memory usage stable for large partitions.
     """
 
-    try:
-        import pyarrow.parquet as pq
-    except ImportError as exc:
-        raise RuntimeError("pyarrow is required for parquet lake output. Install project dependencies.") from exc
-
-    dataset_type = "ohlcv"
-    partition_root = (
-        Path(lake_root)
-        / f"dataset_type={dataset_type}"
-        / f"exchange={exchange}"
-        / f"instrument_type={market}"
-        / f"symbol={symbol}"
-        / f"timeframe={timeframe}"
+    return open_times_in_lake_by_dataset(
+        lake_root=lake_root,
+        dataset_type="ohlcv",
+        market=market,
+        exchange=exchange,
+        symbol=symbol,
+        timeframe=timeframe,
     )
-    if not partition_root.exists():
-        return []
-
-    values: list[datetime] = []
-    for data_file in sorted(partition_root.glob("date=*/data.parquet")):
-        parquet_file = pq.ParquetFile(data_file)  # type: ignore[no-untyped-call]
-        for batch in parquet_file.iter_batches(columns=["open_time"], batch_size=10_000):  # type: ignore[no-untyped-call]
-            for row in batch.to_pylist():
-                value = row.get("open_time")
-                if isinstance(value, datetime):
-                    values.append(value)
-    return sorted(set(values))
 
 
 def load_spot_candles_from_lake(
@@ -266,6 +324,60 @@ def save_spot_candles_parquet_lake(
     return sorted(written_files)
 
 
+def save_open_interest_parquet_lake(
+    open_interest_by_exchange: dict[str, dict[str, list[OpenInterestPoint]]],
+    market: str,
+    lake_root: str,
+) -> list[str]:
+    """Save fetched open-interest data to parquet lake partitions."""
+
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required for parquet lake output. Install project dependencies.") from exc
+
+    run_id = utc_run_id()
+    ingested_at = datetime.now(UTC)
+    dataset_type = "open_interest"
+
+    grouped: defaultdict[PartitionKey, list[dict[str, object]]] = defaultdict(list)
+    for symbol_map in open_interest_by_exchange.values():
+        for items in symbol_map.values():
+            for item in items:
+                key = open_interest_partition_key(item=item, market=market)
+                grouped[key].append(
+                    open_interest_record(item=item, market=market, run_id=run_id, ingested_at=ingested_at)
+                )
+
+    def _write_one_partition(key: PartitionKey, rows: list[dict[str, object]]) -> str:
+        part_dir = partition_path(lake_root=lake_root, dataset_type=dataset_type, key=key)
+        part_dir.mkdir(parents=True, exist_ok=True)
+        file_path = part_dir / "data.parquet"
+        staging_path = part_dir / f".staging-{run_id}.parquet"
+
+        existing_rows: list[dict[str, object]] = []
+        if file_path.exists():
+            existing_table = pq.ParquetFile(file_path).read()  # type: ignore[no-untyped-call]
+            existing_rows = existing_table.to_pylist()
+
+        merged_rows = merge_and_deduplicate_rows(existing=existing_rows, new=rows)
+        table = pa.Table.from_pylist(merged_rows)
+        pq.write_table(table, staging_path)  # type: ignore[no-untyped-call]
+        staging_path.replace(file_path)
+        return str(file_path.resolve())
+
+    written_files: list[str] = []
+    if grouped:
+        max_workers = min(4, len(grouped))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_write_one_partition, key, rows) for key, rows in grouped.items()]
+            for future in concurrent.futures.as_completed(futures):
+                written_files.append(future.result())
+
+    return sorted(written_files)
+
+
 def load_combined_dataframe_from_lake(
     lake_root: str,
     exchanges: list[str] | None = None,
@@ -275,6 +387,7 @@ def load_combined_dataframe_from_lake(
     start_time: datetime | None = None,
     end_time: datetime | None = None,
     limit: int | None = None,
+    include_open_interest: bool = False,
 ) -> Any:
     """Load combined spot/perp OHLCV rows from parquet lake as a pandas DataFrame."""
 
@@ -356,13 +469,60 @@ def load_combined_dataframe_from_lake(
         "source_endpoint",
     ]
     if not frames:
-        return pd.DataFrame(columns=columns)
+        dataframe = pd.DataFrame(columns=columns)
+    else:
+        dataframe = pd.concat(frames, ignore_index=True)
+        dataframe = dataframe.sort_values(
+            by=["open_time", "exchange", "instrument_type", "symbol", "timeframe"],
+            kind="mergesort",
+        )
+        if limit is not None:
+            dataframe = dataframe.head(limit)
 
-    dataframe = pd.concat(frames, ignore_index=True)
-    dataframe = dataframe.sort_values(
-        by=["open_time", "exchange", "instrument_type", "symbol", "timeframe"],
-        kind="mergesort",
-    )
-    if limit is not None:
-        dataframe = dataframe.head(limit)
+    if include_open_interest:
+        oi_files = sorted(
+            Path(lake_root).glob(
+                "dataset_type=open_interest/exchange=*/instrument_type=*/symbol=*/timeframe=*/date=*/data.parquet"
+            )
+        )
+        oi_frames: list[Any] = []
+        for data_file in oi_files:
+            parquet_file = pq.ParquetFile(data_file)  # type: ignore[no-untyped-call]
+            for batch in parquet_file.iter_batches(batch_size=10_000):  # type: ignore[no-untyped-call]
+                frame = batch.to_pandas()
+                if start_time is not None:
+                    frame = frame[frame["open_time"] >= start_time]
+                if end_time is not None:
+                    frame = frame[frame["open_time"] <= end_time]
+                if frame.empty:
+                    continue
+                oi_frames.append(frame)
+
+        if oi_frames:
+            oi_frame = pd.concat(oi_frames, ignore_index=True)
+            oi_frame = oi_frame.sort_values(by=["open_time"], kind="mergesort")
+            oi_frame = oi_frame.drop_duplicates(
+                subset=["exchange", "instrument_type", "symbol", "timeframe", "open_time"],
+                keep="last",
+            )
+            oi_frame = oi_frame[
+                [
+                    "exchange",
+                    "instrument_type",
+                    "symbol",
+                    "timeframe",
+                    "open_time",
+                    "open_interest",
+                    "open_interest_value",
+                ]
+            ]
+            dataframe = dataframe.merge(
+                oi_frame,
+                on=["exchange", "instrument_type", "symbol", "timeframe", "open_time"],
+                how="left",
+            )
+        else:
+            dataframe["open_interest"] = None
+            dataframe["open_interest_value"] = None
+
     return dataframe

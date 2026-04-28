@@ -2,6 +2,7 @@
 
 ## Abstract
 This report presents a production-oriented baseline for multi-exchange cryptocurrency candle ingestion designed to support downstream quantitative research. The problem addressed is the lack of reproducible, maintainable ingestion layers in early-stage quant projects, where exchange-specific scripts and schema drift frequently undermine empirical validity. We implement a typed, modular ingestion pipeline with adapter abstractions for Binance, Deribit, and Bybit, a command-line interface for deterministic execution (including multi-market runs such as `--market spot perp`), and partitioned parquet-lake storage. Data are sourced from public exchange REST endpoints and normalized into a canonical OHLCV schema with metadata fields for run traceability. The main finding is engineering-focused: the system provides deterministic normalization across heterogeneous API payloads, supports backward pagination and gap-fill synchronization, and preserves idempotent persistence via natural-key partition merges. The contribution is a maintainable ingestion foundation suitable for subsequent market microstructure, regime, and forecasting studies, with explicit reproducibility controls (strict typing, tests, linting, and stable execution commands).
+This report presents a production-oriented baseline for multi-exchange cryptocurrency candle ingestion designed to support downstream quantitative research. The problem addressed is the lack of reproducible, maintainable ingestion layers in early-stage quant projects, where exchange-specific scripts and schema drift frequently undermine empirical validity. We implement a typed, modular ingestion pipeline with adapter abstractions for Binance, Deribit, and Bybit, a command-line interface for deterministic execution (including multi-market runs such as `--market spot perp`), and partitioned parquet-lake storage. Data are sourced from public exchange REST endpoints and normalized into canonical OHLCV and open-interest schemas with metadata fields for run traceability. The main finding is engineering-focused: the system provides deterministic normalization across heterogeneous API payloads, supports backward pagination and gap-fill synchronization, and preserves idempotent persistence via natural-key partition merges. The contribution is a maintainable ingestion foundation suitable for subsequent market microstructure, regime, and forecasting studies, with explicit reproducibility controls (strict typing, tests, linting, and stable execution commands).
 
 ## Introduction
 Reliable market-data ingestion is a prerequisite for valid quantitative inference in crypto research.
@@ -22,6 +23,7 @@ Within crypto-specific empirical work, market microstructure studies and liquidi
 - Sample period: user-configurable runtime period determined by symbols, markets, timeframes, and existing parquet coverage.
 - Number of observations: runtime-dependent on symbol/timeframe scope and auto bootstrap vs gap-fill behavior.
 - Variables: `open_time`, `close_time`, `open`, `high`, `low`, `close`, `volume`, `quote_volume`, `trade_count` plus provenance metadata.
+- Additional perp feature set: `open_interest`, `open_interest_value` where available.
 - Cleaning methodology: exchange adapter normalization, timeframe validation, symbol normalization, UTC conversion, partition-level deduplication by natural key.
 - Train/test split: not applicable at ingestion-only stage.
 
@@ -55,6 +57,9 @@ Upsert policy enforces idempotency:
 \]
 
 ### Optimization Logic
+- Loader operates in exactly two modes:
+  1. `fetch all history` for symbol/timeframe partitions that do not yet exist in parquet.
+  2. `fill gaps` for existing partitions by recovering missing internal intervals and tail intervals.
 - Bounded HTTP retries with exponential backoff for transient failures.
 - Pagination for exchange request limits.
 - Gap-fill computes missing intervals from stored open-time sets.
@@ -91,6 +96,7 @@ No predictive or regime models are trained in this stage.
 | Gap-fill mode | Missing internal/tail intervals | Passed via open-time range recovery |
 | Incremental parquet persistence | Partition merge + natural-key dedup | Passed with idempotent key policy |
 | Grouped export artifacts | Per `(exchange, symbol, timeframe)` dataframe + plot | Passed with per-file range metadata |
+| Open-interest integration | Binance perp dataset_type=open_interest | Passed for all-history and gap-fill paths |
 
 ### Figures
 Figure 1. Binance BTCUSDT 1m close series.

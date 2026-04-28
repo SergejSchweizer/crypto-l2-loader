@@ -122,6 +122,13 @@ def test_deribit_symbol_normalization_perp_aliases() -> None:
     assert deribit.normalize_symbol("ETHUSDT", "perp") == "ETH-PERPETUAL"
 
 
+def test_binance_symbol_normalization_spot_aliases() -> None:
+    from ingestion.exchanges import binance as binance_exchange
+
+    assert binance_exchange.normalize_symbol("BTC", "spot") == "BTCUSDT"
+    assert binance_exchange.normalize_symbol("ETH", "spot") == "ETHUSDT"
+
+
 def test_fetch_deribit_candles_respects_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     from ingestion.exchanges import deribit as deribit_exchange
 
@@ -268,7 +275,7 @@ def test_fetch_all_history_routes_to_exchange_all_fetch(monkeypatch: pytest.Monk
 @pytest.mark.parametrize(
     ("exchange", "market", "input_symbol", "expected_fetch_symbol", "expected_candle_symbol"),
     [
-        ("binance", "spot", "BTCUSDT", "BTCUSDT", "BTCUSDT"),
+        ("binance", "spot", "BTC", "BTCUSDT", "BTCUSDT"),
         ("binance", "perp", "BTC", "BTCUSDT", "BTCUSDT"),
         ("deribit", "spot", "BTCUSDT", "BTCUSDT", "BTC_USDC"),
         ("deribit", "perp", "BTC", "BTC", "BTC-PERPETUAL"),
@@ -323,6 +330,13 @@ def test_bybit_symbol_normalization_perp_aliases() -> None:
 
     assert bybit_exchange.normalize_symbol("BTC", "perp") == "BTCUSDT"
     assert bybit_exchange.normalize_symbol("ETHUSDT", "perp") == "ETHUSDT"
+
+
+def test_bybit_symbol_normalization_spot_aliases() -> None:
+    from ingestion.exchanges import bybit as bybit_exchange
+
+    assert bybit_exchange.normalize_symbol("BTC", "spot") == "BTCUSDT"
+    assert bybit_exchange.normalize_symbol("ETH", "spot") == "ETHUSDT"
 
 
 def test_fetch_bybit_spot_routes_to_bybit_market_kline(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -157,44 +157,50 @@ Perpetual symbol normalization is exchange-specific. The loader accepts aliases 
 | Bybit | `BTCUSDT`, `ETHUSDT` | `BTC`, `BTCUSD`, `BTCUSDT`; `ETH`, `ETHUSD`, `ETHUSDT` | `BTCUSDT`, `ETHUSDT` |
 
 Portable CLI recommendation:
-- Use `BTC` / `ETH` with `--market perp` when running cross-exchange commands; adapters normalize to exchange-specific canonical symbols.
+- Use `BTC` / `ETH` for cross-exchange commands on both `spot` and `perp`; adapters normalize to exchange-specific canonical symbols.
 
 ## 6. Execution Workflow
 
 Load BTC/ETH spot candles:
 
 ```bash
-python3 main.py loader --exchange binance --market spot --symbols BTCUSDT ETHUSDT --timeframe H1
+python3 main.py loader --exchange binance --market spot --symbols BTC ETH --timeframe H1
 ```
 
 Load spot and perp in one run:
 
 ```bash
-python3 main.py loader --exchanges binance deribit --market spot perp --symbols BTCUSDT ETHUSDT --timeframe M1
+python3 main.py loader --exchanges binance deribit --market spot perp --symbols BTC ETH --timeframe M1
 ```
 
 Load multiple exchanges in one run:
 
 ```bash
-python3 main.py loader --exchanges binance deribit --market spot --symbols BTCUSDT ETHUSDT --timeframe M1
+python3 main.py loader --exchanges binance deribit --market spot --symbols BTC ETH --timeframe M1
 ```
 
 Load multiple timeframes in one run (executed sequentially across exchange/market/symbol/timeframe):
 
 ```bash
-python3 main.py loader --exchanges binance deribit --market spot --symbols BTCUSDT ETHUSDT --timeframes M1 M5 H1 --no-json-output
+python3 main.py loader --exchanges binance deribit --market spot --symbols BTC ETH --timeframes M1 M5 H1 --no-json-output
 ```
 
 Load and generate plots (price + volume) under `plots/`:
 
 ```bash
-python3 main.py loader --exchanges binance deribit --market spot --symbols BTCUSDT ETHUSDT --timeframe M5 --plot --plot-dir plots --plot-price close
+python3 main.py loader --exchanges binance deribit --market spot --symbols BTC ETH --timeframe M5 --plot --plot-dir plots --plot-price close
 ```
 
 Save loaded data to parquet lake format:
 
 ```bash
-python3 main.py loader --exchanges binance deribit --market spot --symbols BTCUSDT ETHUSDT --timeframe H1 --save-parquet-lake --lake-root lake/bronze
+python3 main.py loader --exchanges binance deribit --market spot --symbols BTC ETH --timeframe H1 --save-parquet-lake --lake-root lake/bronze
+```
+
+Fetch both OHLCV and open interest (perp):
+
+```bash
+python3 main.py loader --exchanges binance --market perp --symbols BTC ETH --timeframe 5m --datasets ohlcv open_interest --save-parquet-lake --lake-root lake/bronze
 ```
 
 Parquet lake write mode uses a stable file per partition (`data.parquet`) with staged merge+rewrite on each run to keep file counts bounded. Partition schema:
@@ -207,16 +213,27 @@ dataset_type=ohlcv/
   timeframe=<interval>/
   date=<YYYY-MM>/
     data.parquet
+
+dataset_type=open_interest/
+  exchange=<exchange>/
+  instrument_type=<perp>/
+  symbol=<symbol>/
+  timeframe=<interval>/
+  date=<YYYY-MM>/
+    data.parquet
 ```
 
 Loader mode is automatic:
+- Only two modes exist:
+  1. `fetch all history` when no parquet data exists for the symbol/timeframe.
+  2. `fill gaps` when parquet data exists (internal gaps + tail to latest closed candle).
 - If no parquet data exists for a symbol/timeframe, it fetches full available exchange history.
 - If parquet data exists, it performs gap-fill (internal gaps + tail to latest closed candle).
 
 Example full-history bootstrap (first run can be long-running):
 
 ```bash
-python3 main.py loader --exchanges binance deribit --market spot --symbols BTCUSDT ETHUSDT --timeframe M1 --save-parquet-lake --lake-root lake/bronze --no-json-output
+python3 main.py loader --exchanges binance deribit --market spot --symbols BTC ETH --timeframe M1 --save-parquet-lake --lake-root lake/bronze --no-json-output
 ```
 
 Note: network fetch tasks are currently sequential. Parquet partition writes are parallelized.
@@ -224,13 +241,19 @@ Note: network fetch tasks are currently sequential. Parquet partition writes are
 Run silently without JSON output:
 
 ```bash
-python3 main.py loader --exchange binance --market spot --symbols BTCUSDT --timeframe M1 --no-json-output
+python3 main.py loader --exchange binance --market spot --symbols BTC --timeframe M1 --no-json-output
 ```
 
 Export combined spot/perp dataset from parquet lake as a dataframe file:
 
 ```bash
 python3 main.py export-df --lake-root lake/bronze --format parquet --output exports --instrument-types spot perp --exchanges binance deribit --timeframes 1m
+```
+
+Include open interest columns in export when available:
+
+```bash
+python3 main.py export-df --lake-root lake/bronze --format parquet --output exports --include-open-interest
 ```
 
 Export writes one file per `exchange_symbol_timeframe`.
