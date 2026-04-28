@@ -55,12 +55,22 @@ def test_fetch_open_interest_all_history_binance(monkeypatch: pytest.MonkeyPatch
     assert rows[0].open_interest == 12.0
 
 
-def test_fetch_open_interest_range_deribit_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    snapshot_ms = int(datetime(2026, 4, 28, 9, 2, tzinfo=UTC).timestamp() * 1000)
+def test_fetch_open_interest_range_deribit_historical(monkeypatch: pytest.MonkeyPatch) -> None:
+    point_ms = int(datetime(2026, 4, 28, 9, 2, tzinfo=UTC).timestamp() * 1000)
     monkeypatch.setattr(
         deribit_open_interest,
-        "fetch_current_open_interest",
-        lambda **kwargs: {"timestamp": snapshot_ms, "open_interest": 1000.0},
+        "fetch_open_interest_range",
+        lambda **kwargs: [{"timestamp": point_ms, "open_interest": 1000.0}],
+    )
+    monkeypatch.setattr(
+        deribit_open_interest,
+        "parse_open_interest_row",
+        lambda symbol, period, row: {
+            "open_time": datetime(2026, 4, 28, 9, 2, tzinfo=UTC),
+            "close_time": datetime(2026, 4, 28, 9, 2, 59, 999000, tzinfo=UTC),
+            "open_interest": float(row["open_interest"]),
+            "open_interest_value": 0.0,
+        },
     )
 
     start = int(datetime(2026, 4, 28, 9, 0, tzinfo=UTC).timestamp() * 1000)

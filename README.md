@@ -179,7 +179,7 @@ Load multiple exchanges in one run:
 python3 main.py loader --exchanges binance deribit --market spot --symbols BTC ETH --timeframe M1
 ```
 
-Load multiple timeframes in one run (executed sequentially across exchange/market/symbol/timeframe):
+Load multiple timeframes in one run:
 
 ```bash
 python3 main.py loader --exchanges binance deribit --market spot --symbols BTC ETH --timeframes M1 M5 H1 --no-json-output
@@ -196,6 +196,16 @@ Save loaded data to parquet lake format:
 ```bash
 python3 main.py loader --exchanges binance deribit --market spot --symbols BTC ETH --timeframe H1 --save-parquet-lake --lake-root lake/bronze
 ```
+
+Save loaded data to TimescaleDB:
+
+```bash
+python3 main.py loader --exchanges binance deribit --market spot perp oi --symbols BTC ETH --timeframe 1m --save-timescaledb --timescaledb-schema market_data
+```
+
+TimescaleDB bootstrap options:
+- Default behavior creates schema/tables/hypertables if missing.
+- Use `--timescaledb-no-bootstrap` to write into pre-existing schema objects only.
 
 Fetch OHLCV (spot+perp) and open interest in one run by including market `oi`:
 
@@ -236,7 +246,10 @@ Example full-history bootstrap (first run can be long-running):
 python3 main.py loader --exchanges binance deribit --market spot --symbols BTC ETH --timeframe M1 --save-parquet-lake --lake-root lake/bronze --no-json-output
 ```
 
-Note: network fetch tasks are currently sequential. Parquet partition writes are parallelized.
+Note:
+- Loader network fetch tasks run in parallel via `asyncio` with bounded concurrency.
+- Parquet partition writes are parallelized.
+- Concurrency is controlled by `L2_FETCH_CONCURRENCY` (default: `8`).
 
 Run silently without JSON output:
 
@@ -244,41 +257,16 @@ Run silently without JSON output:
 python3 main.py loader --exchange binance --market spot --symbols BTC --timeframe M1 --no-json-output
 ```
 
-Export combined spot/perp dataset from parquet lake as a dataframe file:
+Ingest existing parquet lake files into TimescaleDB (no internet fetch):
 
 ```bash
-python3 main.py export-df --lake-root lake/bronze --format parquet --output exports --instrument-types spot perp --exchanges binance deribit --timeframes 1m
+python3 main.py ingest-timescaledb --lake-root lake/bronze --timescaledb-schema market_data
 ```
 
-Open interest columns are included by default:
+Optional filters for offline parquet->Timescale ingestion:
 
 ```bash
-python3 main.py export-df --lake-root lake/bronze --format parquet --output exports
-```
-
-Disable open interest join explicitly:
-
-```bash
-python3 main.py export-df --lake-root lake/bronze --format parquet --output exports --no-open-interest
-```
-
-Export writes one file per `exchange_symbol_timeframe`.
-Each file contains both `spot` and `perp` rows for that group (if available in lake data).
-For each exported dataframe file, a matching full plot (`spot` price + volume) is also saved
-with the same base name and `.png` extension.
-If `--output` is omitted, files are written to `/volume1/Temp/crypto`.
-The export JSON summary includes extended per-file metadata in `generated_files`
-(data file path, plot file path, row count, and start/end `open_time` range).
-If export result is empty after filters/time range, no fallback file is created.
-
-Examples:
-- `binance_BTCUSDT_1m_full.csv`
-- `deribit_ETHUSDT_5m_full.parquet`
-
-CSV export variant:
-
-```bash
-python3 main.py export-df --lake-root lake/bronze --format csv --output exports --start-time 2026-01-01T00:00:00Z --end-time 2026-12-31T23:59:59Z
+python3 main.py ingest-timescaledb --lake-root lake/bronze --exchanges deribit --instrument-types perp --timeframes 1m
 ```
 
 Load Binance + Deribit perpetual candles (portable perp inputs):
@@ -299,33 +287,34 @@ python3 main.py list-spot-timeframes --exchanges binance deribit
 
 ### 7.1 OHLCV (Spot)
 Description:
-OHLCV spot rows capture exchange-traded candle bars for cash markets. Exported dataframes are grouped per `exchange_symbol_timeframe`.
+OHLCV spot rows capture exchange-traded candle bars for cash markets.  
+The loader writes grouped sample artifacts per run under `samples/`.
 
 Plot:
-`<output_dir>/<exchange>_<symbol>_<timeframe>_full.png` (price + volume).
+`samples/spot_<exchange>_<symbol>_<timeframe>_sample_10_rows.png` (full-history price + volume plot for that group).
 
 Example:
-`/volume1/Temp/crypto/binance_BTCUSDT_1m_full.png`
+`samples/spot_binance_BTCUSDT_1m_sample_10_rows.png`
 
 ### 7.2 OHLCV (Perp)
 Description:
-Perpetual OHLCV rows follow the same candle schema and are combined with spot rows in the same grouped dataframe when both exist.
+Perpetual OHLCV rows follow the same candle schema and are stored independently per market group.
 
 Plot:
-`<output_dir>/<exchange>_<symbol>_<timeframe>_full.png` (price + volume, includes perp rows present in the group).
+`samples/perp_<exchange>_<symbol>_<timeframe>_sample_10_rows.png` (full-history price + volume plot for that group).
 
 Example:
-`/volume1/Temp/crypto/binance_BTCUSDT_1m_full.png`
+`samples/perp_binance_BTCUSDT_1m_sample_10_rows.png`
 
 ### 7.3 Open Interest (OI)
 Description:
-Open-interest rows are stored under `dataset_type=open_interest` and are joined into exports by default (unless `--no-open-interest` is set).
+Open-interest rows are stored under `dataset_type=open_interest` and sampled per run when `--market oi` is used.
 
 Plot:
-`<output_dir>/<exchange>_<symbol>_<timeframe>_open_interest.png` (OI time-series line chart).
+`samples/oi_<market>_<exchange>_<symbol>_<timeframe>_sample_10_rows.png` (full-history OI time-series line chart for that group).
 
 Example:
-`/volume1/Temp/crypto/binance_BTCUSDT_1m_open_interest.png`
+`samples/oi_perp_binance_BTCUSDT_5m_sample_10_rows.png`
 
 ## 8. Testing Instructions
 
@@ -341,6 +330,14 @@ Equivalent direct commands:
 .venv/bin/python -m mypy .
 ```
 
+Pre-commit hooks:
+
+```bash
+python -m pip install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
+
 ## 9. Deployment Instructions
 
 - For now this is a local CLI tool.
@@ -349,6 +346,9 @@ Equivalent direct commands:
 - Runtime logs are written to `/volume1/Temp/logs/crypto-l2-loader.log` by default.
 - Logs rotate every 7 days and rotated files are date-suffixed (for example `crypto-l2-loader.log.2026-04-27`) and retained in the same directory.
 - Optional override: set `L2_SYNC_LOG_DIR` to change the log directory.
+- Optional override: set `L2_FETCH_CONCURRENCY` to control loader fetch parallelism (minimum `1`, default `8`).
+- TimescaleDB sink env vars: `TIMESCALEDB_HOST`, `TIMESCALEDB_PORT`, `TIMESCALEDB_USER`, `TIMESCALEDB_PASSWORD`, `TIMESCALEDB_DB`, `PGSSLMODE`.
+- Run quality gates via module form (`python -m pytest`, `python -m mypy`, `python -m ruff`) to avoid local venv entrypoint shebang drift when directories move.
 
 ## 10. Known Limitations
 

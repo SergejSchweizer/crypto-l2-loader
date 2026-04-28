@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, cast
 
 from ingestion.exchanges import binance_open_interest, bybit_open_interest, deribit_open_interest
@@ -48,18 +48,6 @@ def open_interest_interval_to_milliseconds(exchange: Exchange, interval: str) ->
     raise ValueError(f"Unsupported exchange '{exchange}'")
 
 
-def _bucket_close_times(point_time: datetime, interval_ms: int) -> tuple[datetime, datetime]:
-    """Bucket a timestamp into interval-aligned open/close times."""
-
-    ts_ms = int(point_time.timestamp() * 1000)
-    open_ms = (ts_ms // interval_ms) * interval_ms
-    close_ms = open_ms + interval_ms - 1
-    return (
-        datetime.fromtimestamp(open_ms / 1000, tz=UTC),
-        datetime.fromtimestamp(close_ms / 1000, tz=UTC),
-    )
-
-
 def fetch_open_interest_all_history(
     exchange: Exchange,
     symbol: str,
@@ -86,21 +74,13 @@ def fetch_open_interest_all_history(
             for row in rows
         ]
     elif exchange == "deribit":
-        snapshot = deribit_open_interest.fetch_current_open_interest(instrument_name=normalized_symbol)
-        if snapshot is None:
-            return []
-        interval_ms = open_interest_interval_to_milliseconds(exchange=exchange, interval=normalized_interval)
-        open_time, close_time = _bucket_close_times(
-            point_time=datetime.fromtimestamp(int(cast(Any, snapshot["timestamp"])) / 1000, tz=UTC),
-            interval_ms=interval_ms,
+        rows = deribit_open_interest.fetch_open_interest_all(
+            symbol=normalized_symbol,
+            period=normalized_interval,
         )
         parsed = [
-            {
-                "open_time": open_time,
-                "close_time": close_time,
-                "open_interest": float(cast(Any, snapshot["open_interest"])),
-                "open_interest_value": 0.0,
-            }
+            deribit_open_interest.parse_open_interest_row(normalized_symbol, normalized_interval, row)
+            for row in rows
         ]
     else:
         return []
@@ -156,24 +136,16 @@ def fetch_open_interest_range(
             for row in rows
         ]
     elif exchange == "deribit":
-        snapshot = deribit_open_interest.fetch_current_open_interest(instrument_name=normalized_symbol)
-        if snapshot is None:
-            return []
-        interval_ms = open_interest_interval_to_milliseconds(exchange=exchange, interval=normalized_interval)
-        open_time, close_time = _bucket_close_times(
-            point_time=datetime.fromtimestamp(int(cast(Any, snapshot["timestamp"])) / 1000, tz=UTC),
-            interval_ms=interval_ms,
+        rows = deribit_open_interest.fetch_open_interest_range(
+            symbol=normalized_symbol,
+            period=normalized_interval,
+            start_open_ms=start_open_ms,
+            end_open_ms=end_open_ms,
         )
-        open_ms = int(open_time.timestamp() * 1000)
-        if start_open_ms <= open_ms <= end_open_ms:
-            parsed = [
-                {
-                    "open_time": open_time,
-                    "close_time": close_time,
-                    "open_interest": float(cast(Any, snapshot["open_interest"])),
-                    "open_interest_value": 0.0,
-                }
-            ]
+        parsed = [
+            deribit_open_interest.parse_open_interest_row(normalized_symbol, normalized_interval, row)
+            for row in rows
+        ]
     else:
         return []
     return [

@@ -487,6 +487,28 @@ def load_combined_dataframe_from_lake(
         )
         oi_frames: list[Any] = []
         for data_file in oi_files:
+            oi_parts = data_file.parts
+            oi_partition_values: dict[str, str] = {}
+            for segment in oi_parts:
+                if "=" not in segment:
+                    continue
+                key, value = segment.split("=", 1)
+                oi_partition_values[key] = value
+
+            exchange_value = oi_partition_values.get("exchange", "")
+            instrument_value = oi_partition_values.get("instrument_type", "")
+            symbol_value = oi_partition_values.get("symbol", "")
+            timeframe_value = oi_partition_values.get("timeframe", "")
+
+            if exchange_filter is not None and exchange_value.lower() not in exchange_filter:
+                continue
+            if instrument_filter is not None and instrument_value.lower() not in instrument_filter:
+                continue
+            if symbol_filter is not None and symbol_value.upper() not in symbol_filter:
+                continue
+            if timeframe_filter is not None and timeframe_value.lower() not in timeframe_filter:
+                continue
+
             parquet_file = pq.ParquetFile(data_file)  # type: ignore[no-untyped-call]
             for batch in parquet_file.iter_batches(batch_size=10_000):  # type: ignore[no-untyped-call]
                 frame = batch.to_pandas()

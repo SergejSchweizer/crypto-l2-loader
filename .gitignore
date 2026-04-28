@@ -1,5 +1,46 @@
+# Default-deny: ignore everything first.
+*
+
+# Allow directory traversal for re-includes.
+!*/
+
+# Root files to keep tracked.
+!.gitignore
+!AGENTS.md
+!README.md
+!REPORT.md
+!Makefile
+!main.py
+!pyproject.toml
+!.pre-commit-config.yaml
+!.env.example
+
+# Source and test trees.
+!api/
+!api/**
+!ingestion/
+!ingestion/**
+!preprocessing/
+!preprocessing/**
+!modeling/
+!modeling/**
+!evaluation/
+!evaluation/**
+!infra/
+!infra/**
+!tests/
+!tests/**
+
+# Documentation and figures.
+!docs/
+!docs/**
+
+# Keep generated sample artifacts.
+!samples/
+!samples/**
+
+# Explicitly ignore local-only runtime/build/cache artifacts.
 .venv/
-.vevn/
 .vscode/
 __pycache__/
 .pytest_cache/
@@ -11,7 +52,10 @@ __pycache__/
 *.egg-info/
 lake/
 plots/
+exports/
 .run/
 lake_test/
 .env
+.env.*
+!.env.example
 docker/.env

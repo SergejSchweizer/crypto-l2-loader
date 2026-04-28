@@ -16,6 +16,7 @@ dependencies = [
   "pandas-stubs>=2.2.0.240218",
   "matplotlib>=3.8.0",
   "pyarrow>=16.0.0",
+  "psycopg[binary]>=3.2.0",
 ]
 
 [tool.setuptools.packages.find]

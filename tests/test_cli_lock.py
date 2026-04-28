@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import fcntl
-import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-import pandas as pd
 import pytest
 
 from api import cli
 from api.cli import SingleInstanceError, SingleInstanceLock
+from ingestion.open_interest import OpenInterestPoint
 from ingestion.spot import SpotCandle
 
 
@@ -150,378 +150,106 @@ def test_main_loader_command_still_uses_single_instance_lock(
         cli.main()
 
 
-def test_main_export_df_does_not_acquire_single_instance_lock(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    class FailIfEnteredLock:
+def test_main_loader_saves_timescaledb_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    class NoopLock:
         def __init__(self, lock_path: str) -> None:
             del lock_path
 
         def __enter__(self) -> None:
-            raise AssertionError("lock should not be used for export-df command")
+            return None
 
         def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
             del exc_type, exc, tb
 
-    fake_df = pd.DataFrame(
-        [
-            {
-                "exchange": "binance",
-                "instrument_type": "spot",
-                "symbol": "BTCUSDT",
-                "timeframe": "1m",
-                "open_time": datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
-                "close_time": datetime(2026, 4, 27, 10, 0, 59, tzinfo=UTC),
-                "open": 100.0,
-                "high": 101.0,
-                "low": 99.0,
-                "close": 100.5,
-                "volume": 12.0,
-                "quote_volume": 1200.0,
-                "trade_count": 10,
-            },
-            {
-                "exchange": "binance",
-                "instrument_type": "perp",
-                "symbol": "BTCUSDT",
-                "timeframe": "1m",
-                "open_time": datetime(2026, 4, 27, 10, 1, tzinfo=UTC),
-                "close_time": datetime(2026, 4, 27, 10, 1, 59, tzinfo=UTC),
-                "open": 100.5,
-                "high": 101.5,
-                "low": 100.0,
-                "close": 101.0,
-                "volume": 11.0,
-                "quote_volume": 1110.0,
-                "trade_count": 9,
-            },
-        ]
+    sample = SpotCandle(
+        exchange="binance",
+        symbol="BTCUSDT",
+        interval="1m",
+        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 0, 59, 999000, tzinfo=UTC),
+        open_price=100.0,
+        high_price=101.0,
+        low_price=99.0,
+        close_price=100.5,
+        volume=10.0,
+        quote_volume=1000.0,
+        trade_count=10,
     )
     captured: dict[str, object] = {}
 
-    def fake_loader(**kwargs: object) -> pd.DataFrame:
-        captured.update(kwargs)
-        return fake_df
-
-    def fake_save_candle_plots(**kwargs: object) -> list[str]:
-        del kwargs
-        temp_plot = output_dir / "temporary_plot.png"
-        temp_plot.parent.mkdir(parents=True, exist_ok=True)
-        temp_plot.write_bytes(b"PNG")
-        return [str(temp_plot.resolve())]
-
-    output_dir = tmp_path / "exports"
-    monkeypatch.setattr(cli, "SingleInstanceLock", FailIfEnteredLock)
-    monkeypatch.setattr(cli, "load_combined_dataframe_from_lake", fake_loader)
-    monkeypatch.setattr(cli, "save_candle_plots", fake_save_candle_plots)
+    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
+    monkeypatch.setattr(cli, "open_times_in_lake", lambda **kwargs: [])
+    monkeypatch.setattr(cli, "fetch_candles_all_history", lambda **kwargs: [sample])
+    monkeypatch.setattr(cli, "_write_loader_samples", lambda **kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "save_market_data_to_timescaledb",
+        lambda **kwargs: captured.update(kwargs) or {"schema": "market_data", "ohlcv_rows": 1, "open_interest_rows": 0},
+    )
     monkeypatch.setattr(
         "sys.argv",
         [
             "main.py",
-            "export-df",
-            "--lake-root",
-            "lake/bronze",
-            "--output",
-            str(output_dir),
-            "--format",
-            "parquet",
+            "loader",
+            "--exchange",
+            "binance",
+            "--market",
+            "spot",
+            "--symbols",
+            "BTCUSDT",
+            "--timeframe",
+            "1m",
+            "--save-timescaledb",
+            "--timescaledb-schema",
+            "crypto_market",
+            "--timescaledb-no-bootstrap",
             "--no-json-output",
         ],
     )
 
     cli.main()
-
-    assert (output_dir / "binance_BTCUSDT_1m_full.parquet").exists()
-    assert (output_dir / "binance_BTCUSDT_1m_full.png").exists()
-    assert captured["lake_root"] == "lake/bronze"
-    assert captured["instrument_types"] == ["spot", "perp"]
+    assert captured["schema"] == "crypto_market"
+    assert captured["create_schema"] is False
 
 
-def test_main_export_df_uses_default_output_name_from_filters(
+def test_write_loader_samples_writes_grouped_csv_and_matching_plot_names(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    frame = pd.DataFrame(
-        [
-            {
-                "exchange": "binance",
-                "instrument_type": "spot",
-                "symbol": "BTCUSDT",
-                "timeframe": "1m",
-                "open_time": datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
-                "close_time": datetime(2026, 4, 27, 10, 0, 59, tzinfo=UTC),
-                "open": 100.0,
-                "high": 101.0,
-                "low": 99.0,
-                "close": 100.5,
-                "volume": 12.0,
-                "quote_volume": 1200.0,
-                "trade_count": 10,
-            },
-            {
-                "exchange": "binance",
-                "instrument_type": "perp",
-                "symbol": "BTCUSDT",
-                "timeframe": "1m",
-                "open_time": datetime(2026, 4, 27, 10, 1, tzinfo=UTC),
-                "close_time": datetime(2026, 4, 27, 10, 1, 59, tzinfo=UTC),
-                "open": 100.5,
-                "high": 101.5,
-                "low": 100.0,
-                "close": 101.0,
-                "volume": 11.0,
-                "quote_volume": 1110.0,
-                "trade_count": 9,
-            },
-        ]
+    candle = SpotCandle(
+        exchange="binance",
+        symbol="BTCUSDT",
+        interval="5m",
+        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 4, 59, 999000, tzinfo=UTC),
+        open_price=100.0,
+        high_price=101.0,
+        low_price=99.0,
+        close_price=100.5,
+        volume=10.0,
+        quote_volume=1000.0,
+        trade_count=10,
     )
-    def fake_save_candle_plots(**kwargs: object) -> list[str]:
-        del kwargs
-        temp_plot = tmp_path / "temporary_plot.png"
-        temp_plot.write_bytes(b"PNG")
-        return [str(temp_plot.resolve())]
-
-    monkeypatch.setattr(cli, "load_combined_dataframe_from_lake", lambda **kwargs: frame)
-    monkeypatch.setattr(cli, "save_candle_plots", fake_save_candle_plots)
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "main.py",
-            "export-df",
-            "--format",
-            "csv",
-            "--output",
-            str(tmp_path),
-            "--exchanges",
-            "binance",
-            "--symbols",
-            "BTCUSDT",
-            "--timeframes",
-            "1m",
-            "--no-json-output",
-        ],
+    oi_point = OpenInterestPoint(
+        exchange="binance",
+        symbol="BTCUSDT",
+        interval="5m",
+        open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
+        close_time=datetime(2026, 4, 27, 10, 4, 59, 999000, tzinfo=UTC),
+        open_interest=123.0,
+        open_interest_value=456.0,
     )
 
-    cli.main()
-
-    assert (tmp_path / "binance_BTCUSDT_1m_full.csv").exists()
-    assert (tmp_path / "binance_BTCUSDT_1m_full.png").exists()
-
-
-def test_main_export_df_creates_one_file_per_exchange_symbol_timeframe(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    frame = pd.DataFrame(
-        [
-            {
-                "exchange": "binance",
-                "instrument_type": "spot",
-                "symbol": "BTCUSDT",
-                "timeframe": "1m",
-                "open_time": datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
-                "close_time": datetime(2026, 4, 27, 10, 0, 59, tzinfo=UTC),
-                "open": 100.0,
-                "high": 101.0,
-                "low": 99.0,
-                "close": 100.5,
-                "volume": 12.0,
-                "quote_volume": 1200.0,
-                "trade_count": 10,
-            },
-            {
-                "exchange": "binance",
-                "instrument_type": "perp",
-                "symbol": "BTCUSDT",
-                "timeframe": "1m",
-                "open_time": datetime(2026, 4, 27, 10, 1, tzinfo=UTC),
-                "close_time": datetime(2026, 4, 27, 10, 1, 59, tzinfo=UTC),
-                "open": 100.5,
-                "high": 101.5,
-                "low": 100.0,
-                "close": 101.0,
-                "volume": 11.0,
-                "quote_volume": 1110.0,
-                "trade_count": 9,
-            },
-            {
-                "exchange": "binance",
-                "instrument_type": "spot",
-                "symbol": "ETHUSDT",
-                "timeframe": "1m",
-                "open_time": datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
-                "close_time": datetime(2026, 4, 27, 10, 0, 59, tzinfo=UTC),
-                "open": 200.0,
-                "high": 201.0,
-                "low": 199.0,
-                "close": 200.5,
-                "volume": 22.0,
-                "quote_volume": 4400.0,
-                "trade_count": 20,
-            },
-            {
-                "exchange": "binance",
-                "instrument_type": "perp",
-                "symbol": "ETHUSDT",
-                "timeframe": "1m",
-                "open_time": datetime(2026, 4, 27, 10, 1, tzinfo=UTC),
-                "close_time": datetime(2026, 4, 27, 10, 1, 59, tzinfo=UTC),
-                "open": 200.5,
-                "high": 201.5,
-                "low": 200.0,
-                "close": 201.0,
-                "volume": 21.0,
-                "quote_volume": 4221.0,
-                "trade_count": 19,
-            },
-        ]
-    )
-    output_dir = tmp_path / "exports"
-    def fake_save_candle_plots(**kwargs: object) -> list[str]:
-        del kwargs
-        temp_plot = output_dir / "temporary_plot.png"
-        temp_plot.parent.mkdir(parents=True, exist_ok=True)
-        temp_plot.write_bytes(b"PNG")
-        return [str(temp_plot.resolve())]
-
-    monkeypatch.setattr(cli, "load_combined_dataframe_from_lake", lambda **kwargs: frame)
-    monkeypatch.setattr(cli, "save_candle_plots", fake_save_candle_plots)
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "main.py",
-            "export-df",
-            "--output",
-            str(output_dir),
-            "--format",
-            "csv",
-            "--no-json-output",
-        ],
+    cli._write_loader_samples(
+        candles_for_storage={"spot": {"binance": {"BTCUSDT": [candle]}}},
+        open_interest_for_storage={"perp": {"binance": {"BTCUSDT": [oi_point]}}},
+        logger=logging.getLogger("test_loader_samples"),
     )
 
-    cli.main()
-
-    assert (output_dir / "binance_BTCUSDT_1m_full.csv").exists()
-    assert (output_dir / "binance_ETHUSDT_1m_full.csv").exists()
-    assert (output_dir / "binance_BTCUSDT_1m_full.png").exists()
-    assert (output_dir / "binance_ETHUSDT_1m_full.png").exists()
-
-
-def test_main_export_df_reports_generated_file_time_ranges(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    frame = pd.DataFrame(
-        [
-            {
-                "exchange": "binance",
-                "instrument_type": "spot",
-                "symbol": "BTCUSDT",
-                "timeframe": "1m",
-                "open_time": datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
-                "close_time": datetime(2026, 4, 27, 10, 0, 59, tzinfo=UTC),
-                "open": 100.0,
-                "high": 101.0,
-                "low": 99.0,
-                "close": 100.5,
-                "volume": 12.0,
-                "quote_volume": 1200.0,
-                "trade_count": 10,
-            },
-            {
-                "exchange": "binance",
-                "instrument_type": "perp",
-                "symbol": "BTCUSDT",
-                "timeframe": "1m",
-                "open_time": datetime(2026, 4, 27, 10, 1, tzinfo=UTC),
-                "close_time": datetime(2026, 4, 27, 10, 1, 59, tzinfo=UTC),
-                "open": 100.5,
-                "high": 101.5,
-                "low": 100.0,
-                "close": 101.0,
-                "volume": 11.0,
-                "quote_volume": 1110.0,
-                "trade_count": 9,
-            },
-        ]
-    )
-    output_dir = tmp_path / "exports"
-
-    def fake_save_candle_plots(**kwargs: object) -> list[str]:
-        del kwargs
-        temp_plot = output_dir / "temporary_plot.png"
-        temp_plot.parent.mkdir(parents=True, exist_ok=True)
-        temp_plot.write_bytes(b"PNG")
-        return [str(temp_plot.resolve())]
-
-    monkeypatch.setattr(cli, "load_combined_dataframe_from_lake", lambda **kwargs: frame)
-    monkeypatch.setattr(cli, "save_candle_plots", fake_save_candle_plots)
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "main.py",
-            "export-df",
-            "--output",
-            str(output_dir),
-            "--format",
-            "csv",
-        ],
-    )
-
-    cli.main()
-
-    payload = json.loads(capsys.readouterr().out)
-    generated = payload["generated_files"]
-    assert len(generated) == 1
-    assert generated[0]["symbol"] == "BTCUSDT"
-    assert generated[0]["start_open_time"] == "2026-04-27T10:00:00+00:00"
-    assert generated[0]["end_open_time"] == "2026-04-27T10:01:00+00:00"
-
-
-def test_main_export_df_no_fallback_when_result_is_empty(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    empty = pd.DataFrame(
-        columns=[
-            "exchange",
-            "instrument_type",
-            "symbol",
-            "timeframe",
-            "open_time",
-            "close_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "quote_volume",
-            "trade_count",
-        ]
-    )
-    output_dir = tmp_path / "exports"
-    monkeypatch.setattr(cli, "load_combined_dataframe_from_lake", lambda **kwargs: empty)
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "main.py",
-            "export-df",
-            "--output",
-            str(output_dir),
-            "--format",
-            "csv",
-        ],
-    )
-
-    cli.main()
-
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["groups"] == 0
-    assert payload["generated_files"] == []
-    assert payload["outputs"] == []
-    assert payload["plots"] == []
-    assert not list(output_dir.glob("*"))
+    sample_files = {path.name for path in (tmp_path / "samples").glob("*")}
+    assert "spot_binance_BTCUSDT_5m_sample_10_rows.csv" in sample_files
+    assert "spot_binance_BTCUSDT_5m_sample_10_rows.png" in sample_files
+    assert "oi_perp_binance_BTCUSDT_5m_sample_10_rows.csv" in sample_files
+    assert "oi_perp_binance_BTCUSDT_5m_sample_10_rows.png" in sample_files
+    assert not any(path.suffix == ".parquet" for path in (tmp_path / "samples").glob("*"))
