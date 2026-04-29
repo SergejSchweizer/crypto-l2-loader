@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import fcntl
 import logging
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+import pandas as pd
 import pytest
 
 from api import cli
@@ -41,7 +43,7 @@ def test_single_instance_lock_raises_on_contention(monkeypatch: pytest.MonkeyPat
 
 def test_auto_mode_fetches_all_history_when_no_lake_data(monkeypatch: pytest.MonkeyPatch) -> None:
     sample = SpotCandle(
-        exchange="binance",
+        exchange="deribit",
         symbol="BTCUSDT",
         interval="1m",
         open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
@@ -65,7 +67,7 @@ def test_auto_mode_fetches_all_history_when_no_lake_data(monkeypatch: pytest.Mon
     monkeypatch.setattr(cli, "fetch_candles_all_history", fake_fetch_candles_all_history)
 
     candles = cli._fetch_symbol_candles(
-        exchange="binance",
+        exchange="deribit",
         market="spot",
         symbol="BTCUSDT",
         timeframe="1m",
@@ -74,7 +76,7 @@ def test_auto_mode_fetches_all_history_when_no_lake_data(monkeypatch: pytest.Mon
 
     assert len(candles) == 1
     assert len(calls) == 1
-    assert calls[0]["exchange"] == "binance"
+    assert calls[0]["exchange"] == "deribit"
     assert calls[0]["symbol"] == "BTCUSDT"
 
 
@@ -102,7 +104,7 @@ def test_gap_fill_fetches_internal_and_tail_gaps(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(cli, "fetch_candles_range", fake_fetch_candles_range)
 
     candles = cli._fetch_symbol_candles(
-        exchange="binance",
+        exchange="deribit",
         market="spot",
         symbol="BTCUSDT",
         timeframe="1m",
@@ -135,7 +137,7 @@ def test_main_loader_command_still_uses_single_instance_lock(
             "main.py",
             "loader",
             "--exchange",
-            "binance",
+            "deribit",
             "--market",
             "spot",
             "--symbols",
@@ -162,7 +164,7 @@ def test_main_loader_saves_timescaledb_when_enabled(monkeypatch: pytest.MonkeyPa
             del exc_type, exc, tb
 
     sample = SpotCandle(
-        exchange="binance",
+        exchange="deribit",
         symbol="BTCUSDT",
         interval="1m",
         open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
@@ -192,7 +194,7 @@ def test_main_loader_saves_timescaledb_when_enabled(monkeypatch: pytest.MonkeyPa
             "main.py",
             "loader",
             "--exchange",
-            "binance",
+            "deribit",
             "--market",
             "spot",
             "--symbols",
@@ -218,7 +220,7 @@ def test_write_loader_samples_writes_grouped_csv_and_matching_plot_names(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     candle = SpotCandle(
-        exchange="binance",
+        exchange="deribit",
         symbol="BTCUSDT",
         interval="5m",
         open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
@@ -232,7 +234,7 @@ def test_write_loader_samples_writes_grouped_csv_and_matching_plot_names(
         trade_count=10,
     )
     oi_point = OpenInterestPoint(
-        exchange="binance",
+        exchange="deribit",
         symbol="BTCUSDT",
         interval="5m",
         open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
@@ -242,14 +244,46 @@ def test_write_loader_samples_writes_grouped_csv_and_matching_plot_names(
     )
 
     cli._write_loader_samples(
-        candles_for_storage={"spot": {"binance": {"BTCUSDT": [candle]}}},
-        open_interest_for_storage={"perp": {"binance": {"BTCUSDT": [oi_point]}}},
+        candles_for_storage={"spot": {"deribit": {"BTCUSDT": [candle]}}},
+        open_interest_for_storage={"perp": {"deribit": {"BTCUSDT": [oi_point]}}},
         logger=logging.getLogger("test_loader_samples"),
     )
 
     sample_files = {path.name for path in (tmp_path / "samples").glob("*")}
-    assert "spot_binance_BTCUSDT_5m_sample_10_rows.csv" in sample_files
-    assert "spot_binance_BTCUSDT_5m_sample_10_rows.png" in sample_files
-    assert "oi_perp_binance_BTCUSDT_5m_sample_10_rows.csv" in sample_files
-    assert "oi_perp_binance_BTCUSDT_5m_sample_10_rows.png" in sample_files
+    assert "spot_deribit_BTCUSDT_5m_sample_10_rows.csv" in sample_files
+    assert "spot_deribit_BTCUSDT_5m_sample_10_rows.png" in sample_files
+    assert "oi_perp_deribit_BTCUSDT_5m_sample_10_rows.csv" in sample_files
+    assert "oi_perp_deribit_BTCUSDT_5m_sample_10_rows.png" in sample_files
     assert not any(path.suffix == ".parquet" for path in (tmp_path / "samples").glob("*"))
+
+
+def test_export_descriptive_stats_writes_csv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rows = [
+        {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 10.0},
+        {"open": 2.0, "high": 3.0, "low": 1.5, "close": 2.5, "volume": 20.0},
+    ]
+    monkeypatch.setattr(cli, "load_combined_dataframe_from_lake", lambda **kwargs: pd.DataFrame(rows))
+    output_csv = tmp_path / "docs" / "tables" / "descriptive_stats_baseline.csv"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "export-descriptive-stats",
+            "--lake-root",
+            str(tmp_path / "lake"),
+            "--output-csv",
+            str(output_csv),
+            "--start-time",
+            "2026-01-01T00:00:00+00:00",
+            "--end-time",
+            "2026-01-31T23:59:59+00:00",
+            "--no-json-output",
+        ],
+    )
+
+    cli.main()
+    assert output_csv.exists()
+    written = pd.read_csv(output_csv)
+    assert list(written.columns) == ["Variable", "Mean", "Std", "Min", "Max"]
+    assert set(written["Variable"]) == {"open", "high", "low", "close", "volume"}

@@ -74,11 +74,12 @@ def _install_fake_psycopg(monkeypatch: pytest.MonkeyPatch, state: dict[str, obje
     monkeypatch.setitem(sys.modules, "psycopg", psycopg_mod)
     monkeypatch.setitem(sys.modules, "psycopg.types", types_mod)
     monkeypatch.setitem(sys.modules, "psycopg.types.json", json_mod)
+    monkeypatch.setenv("TIMESCALEDB_PASSWORD", "test-password")
 
 
 def _sample_candle() -> SpotCandle:
     return SpotCandle(
-        exchange="binance",
+        exchange="deribit",
         symbol="BTCUSDT",
         interval="5m",
         open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
@@ -95,7 +96,7 @@ def _sample_candle() -> SpotCandle:
 
 def _sample_oi() -> OpenInterestPoint:
     return OpenInterestPoint(
-        exchange="binance",
+        exchange="deribit",
         symbol="BTCUSDT",
         interval="5m",
         open_time=datetime(2026, 4, 27, 10, 0, tzinfo=UTC),
@@ -115,6 +116,12 @@ def test_save_market_data_to_timescaledb_rejects_invalid_schema_name() -> None:
         )
 
 
+def test_db_settings_requires_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TIMESCALEDB_PASSWORD", raising=False)
+    with pytest.raises(RuntimeError, match="TIMESCALEDB_PASSWORD is required"):
+        sink._db_settings()
+
+
 def test_save_market_data_to_timescaledb_uses_timezone_aware_ingested_at(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -122,8 +129,8 @@ def test_save_market_data_to_timescaledb_uses_timezone_aware_ingested_at(
     _install_fake_psycopg(monkeypatch, state)
 
     result = sink.save_market_data_to_timescaledb(
-        candles_for_storage={"spot": {"binance": {"BTCUSDT": [_sample_candle()]}}},
-        open_interest_for_storage={"perp": {"binance": {"BTCUSDT": [_sample_oi()]}}},
+        candles_for_storage={"spot": {"deribit": {"BTCUSDT": [_sample_candle()]}}},
+        open_interest_for_storage={"perp": {"deribit": {"BTCUSDT": [_sample_oi()]}}},
         schema="market_data",
         create_schema=True,
     )
@@ -144,7 +151,7 @@ def test_save_market_data_to_timescaledb_serializes_datetime_in_extra(
     _install_fake_psycopg(monkeypatch, state)
 
     sink.save_market_data_to_timescaledb(
-        candles_for_storage={"spot": {"binance": {"BTCUSDT": [_sample_candle()]}}},
+        candles_for_storage={"spot": {"deribit": {"BTCUSDT": [_sample_candle()]}}},
         open_interest_for_storage={},
         schema="market_data",
         create_schema=False,
@@ -185,7 +192,7 @@ def test_loader_parquet_then_ingest_timescaledb_end_to_end(
             "main.py",
             "loader",
             "--exchange",
-            "binance",
+            "deribit",
             "--market",
             "spot",
             "oi",

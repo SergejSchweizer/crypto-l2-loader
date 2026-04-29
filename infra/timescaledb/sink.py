@@ -32,11 +32,17 @@ def _validate_sql_identifier(value: str, kind: str = "identifier") -> str:
 def _db_settings() -> dict[str, Any]:
     """Read TimescaleDB connection settings from environment."""
 
+    password = os.getenv("TIMESCALEDB_PASSWORD")
+    if password is None or password == "":
+        raise RuntimeError(
+            "TIMESCALEDB_PASSWORD is required. Set it in your local environment or .env (not committed)."
+        )
+
     return {
         "host": os.getenv("TIMESCALEDB_HOST", "127.0.0.1"),
         "port": int(os.getenv("TIMESCALEDB_PORT", "54321")),
         "user": os.getenv("TIMESCALEDB_USER", "crypto"),
-        "password": os.getenv("TIMESCALEDB_PASSWORD", "784542"),
+        "password": password,
         "dbname": os.getenv("TIMESCALEDB_DB", "crypto"),
         "sslmode": os.getenv("PGSSLMODE", "disable"),
     }

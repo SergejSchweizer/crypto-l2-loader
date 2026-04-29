@@ -10,7 +10,7 @@ from ingestion.spot import SpotCandle
 
 def _sample_candle() -> SpotCandle:
     return SpotCandle(
-        exchange="binance",
+        exchange="deribit",
         symbol="BTCUSDT",
         interval="1m",
         open_time=datetime(2026, 1, 1, tzinfo=UTC),

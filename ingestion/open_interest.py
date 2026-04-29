@@ -1,4 +1,4 @@
-"""Open-interest ingestion interface across exchanges."""
+"""Open-interest ingestion interface (Deribit-only)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 
-from ingestion.exchanges import binance_open_interest, bybit_open_interest, deribit_open_interest
+from ingestion.exchanges import deribit_open_interest
 from ingestion.spot import Exchange, Market, interval_to_milliseconds, normalize_storage_symbol, normalize_timeframe
 
 
@@ -26,26 +26,18 @@ class OpenInterestPoint:
 def normalize_open_interest_timeframe(exchange: Exchange, value: str) -> str:
     """Normalize open-interest timeframe by exchange."""
 
-    if exchange == "binance":
-        return binance_open_interest.normalize_period(value)
-    if exchange == "bybit":
-        return bybit_open_interest.normalize_period(value)
-    if exchange == "deribit":
-        # Deribit adapter currently supports snapshot collection bucketed by requested timeframe.
-        return normalize_timeframe(exchange=exchange, value=value)
-    raise ValueError(f"Unsupported exchange '{exchange}'")
+    if exchange != "deribit":
+        raise ValueError(f"Unsupported exchange '{exchange}'")
+    # Deribit adapter currently supports snapshot collection bucketed by requested timeframe.
+    return normalize_timeframe(exchange=exchange, value=value)
 
 
 def open_interest_interval_to_milliseconds(exchange: Exchange, interval: str) -> int:
     """Convert open-interest interval to milliseconds."""
 
-    if exchange == "binance":
-        return binance_open_interest.period_to_milliseconds(interval)
-    if exchange == "bybit":
-        return bybit_open_interest.period_to_milliseconds(interval)
-    if exchange == "deribit":
-        return interval_to_milliseconds(exchange=exchange, interval=interval)
-    raise ValueError(f"Unsupported exchange '{exchange}'")
+    if exchange != "deribit":
+        raise ValueError(f"Unsupported exchange '{exchange}'")
+    return interval_to_milliseconds(exchange=exchange, interval=interval)
 
 
 def fetch_open_interest_all_history(
@@ -61,29 +53,16 @@ def fetch_open_interest_all_history(
     normalized_interval = normalize_open_interest_timeframe(exchange=exchange, value=interval)
     normalized_symbol = normalize_storage_symbol(exchange=exchange, symbol=symbol, market=market)
     parsed: list[dict[str, object]] = []
-    if exchange == "binance":
-        rows = binance_open_interest.fetch_open_interest_all(symbol=normalized_symbol, period=normalized_interval)
-        parsed = [
-            binance_open_interest.parse_open_interest_row(normalized_symbol, normalized_interval, row)
-            for row in rows
-        ]
-    elif exchange == "bybit":
-        rows = bybit_open_interest.fetch_open_interest_all(symbol=normalized_symbol, period=normalized_interval)
-        parsed = [
-            bybit_open_interest.parse_open_interest_row(normalized_symbol, normalized_interval, row)
-            for row in rows
-        ]
-    elif exchange == "deribit":
-        rows = deribit_open_interest.fetch_open_interest_all(
-            symbol=normalized_symbol,
-            period=normalized_interval,
-        )
-        parsed = [
-            deribit_open_interest.parse_open_interest_row(normalized_symbol, normalized_interval, row)
-            for row in rows
-        ]
-    else:
+    if exchange != "deribit":
         return []
+    rows = deribit_open_interest.fetch_open_interest_all(
+        symbol=normalized_symbol,
+        period=normalized_interval,
+    )
+    parsed = [
+        deribit_open_interest.parse_open_interest_row(normalized_symbol, normalized_interval, row)
+        for row in rows
+    ]
     return [
         OpenInterestPoint(
             exchange=exchange,
@@ -113,41 +92,18 @@ def fetch_open_interest_range(
     normalized_interval = normalize_open_interest_timeframe(exchange=exchange, value=interval)
     normalized_symbol = normalize_storage_symbol(exchange=exchange, symbol=symbol, market=market)
     parsed: list[dict[str, object]] = []
-    if exchange == "binance":
-        rows = binance_open_interest.fetch_open_interest_range(
-            symbol=normalized_symbol,
-            period=normalized_interval,
-            start_open_ms=start_open_ms,
-            end_open_ms=end_open_ms,
-        )
-        parsed = [
-            binance_open_interest.parse_open_interest_row(normalized_symbol, normalized_interval, row)
-            for row in rows
-        ]
-    elif exchange == "bybit":
-        rows = bybit_open_interest.fetch_open_interest_range(
-            symbol=normalized_symbol,
-            period=normalized_interval,
-            start_open_ms=start_open_ms,
-            end_open_ms=end_open_ms,
-        )
-        parsed = [
-            bybit_open_interest.parse_open_interest_row(normalized_symbol, normalized_interval, row)
-            for row in rows
-        ]
-    elif exchange == "deribit":
-        rows = deribit_open_interest.fetch_open_interest_range(
-            symbol=normalized_symbol,
-            period=normalized_interval,
-            start_open_ms=start_open_ms,
-            end_open_ms=end_open_ms,
-        )
-        parsed = [
-            deribit_open_interest.parse_open_interest_row(normalized_symbol, normalized_interval, row)
-            for row in rows
-        ]
-    else:
+    if exchange != "deribit":
         return []
+    rows = deribit_open_interest.fetch_open_interest_range(
+        symbol=normalized_symbol,
+        period=normalized_interval,
+        start_open_ms=start_open_ms,
+        end_open_ms=end_open_ms,
+    )
+    parsed = [
+        deribit_open_interest.parse_open_interest_row(normalized_symbol, normalized_interval, row)
+        for row in rows
+    ]
     return [
         OpenInterestPoint(
             exchange=exchange,

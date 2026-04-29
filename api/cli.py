@@ -8,24 +8,31 @@ import fcntl
 import json
 import logging
 import os
-import re
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import pandas as pd
 
+from application.services.artifact_service import write_loader_samples
+from application.services.fetch_service import (
+    CandleFetchTask,
+    OpenInterestFetchTask,
+    fetch_candle_tasks_parallel,
+    fetch_open_interest_tasks_parallel,
+    fetch_symbol_candles,
+    fetch_symbol_open_interest,
+)
+from application.services.gapfill_service import _last_closed_open_ms, _missing_ranges_ms
+from application.services.storage_service import persist_loader_outputs
 from infra.timescaledb import save_market_data_to_timescaledb, save_parquet_lake_to_timescaledb
 from ingestion.lake import (
-    candle_record,
+    load_combined_dataframe_from_lake,
     load_spot_candles_from_lake,
-    open_interest_record,
     open_times_in_lake,
     open_times_in_lake_by_dataset,
-    save_open_interest_parquet_lake,
-    save_spot_candles_parquet_lake,
 )
 from ingestion.open_interest import (
     OpenInterestPoint,
@@ -34,7 +41,7 @@ from ingestion.open_interest import (
     normalize_open_interest_timeframe,
     open_interest_interval_to_milliseconds,
 )
-from ingestion.plotting import PriceField, save_candle_plots, save_open_interest_plot
+from ingestion.plotting import PriceField, save_candle_plots
 from ingestion.spot import (
     Exchange,
     Market,
@@ -50,8 +57,7 @@ from ingestion.spot import (
 LOGGER_NAME = "crypto_l2_loader"
 DEFAULT_LOG_DIR = "/volume1/Temp/logs"
 DEFAULT_FETCH_CONCURRENCY = 8
-DatasetType = str
-CliMarket = str
+DataType = Literal["spot", "perp", "oi"]
 
 
 class SingleInstanceError(RuntimeError):
@@ -131,45 +137,6 @@ def _serialize_candle(candle: SpotCandle) -> dict[str, object]:
     return data
 
 
-def _last_closed_open_ms(interval_ms: int, now_utc: datetime | None = None) -> int:
-    """Return open timestamp (ms) of latest fully closed candle."""
-
-    now = now_utc or datetime.now(UTC)
-    now_ms = int(now.timestamp() * 1000)
-    return ((now_ms // interval_ms) - 1) * interval_ms
-
-
-def _missing_ranges_ms(
-    existing_open_times: list[datetime],
-    interval_ms: int,
-    end_open_ms: int,
-) -> list[tuple[int, int]]:
-    """Build contiguous missing open-time ranges from known candles to end-open timestamp."""
-
-    existing_ms = sorted(
-        {
-            int(item.timestamp() * 1000)
-            for item in existing_open_times
-            if item.tzinfo is not None and int(item.timestamp() * 1000) <= end_open_ms
-        }
-    )
-    if not existing_ms:
-        return []
-
-    ranges: list[tuple[int, int]] = []
-    for previous, current in zip(existing_ms, existing_ms[1:], strict=False):
-        gap_start_ms = previous + interval_ms
-        gap_end_ms = current - interval_ms
-        if gap_start_ms <= gap_end_ms:
-            ranges.append((gap_start_ms, gap_end_ms))
-
-    last_existing_ms = existing_ms[-1]
-    if last_existing_ms + interval_ms <= end_open_ms:
-        ranges.append((last_existing_ms + interval_ms, end_open_ms))
-
-    return ranges
-
-
 def _fetch_symbol_candles(
     exchange: Exchange,
     market: Market,
@@ -184,50 +151,20 @@ def _fetch_symbol_candles(
     - If data exists, perform gap-fill up to latest fully closed candle.
     """
 
-    storage_symbol = normalize_storage_symbol(exchange=exchange, symbol=symbol, market=market)
-    stored_open_times = open_times_in_lake(
-        lake_root=lake_root,
-        market=market,
+    return fetch_symbol_candles(
         exchange=exchange,
-        symbol=storage_symbol,
+        market=market,
+        symbol=symbol,
         timeframe=timeframe,
+        lake_root=lake_root,
+        open_times_reader=open_times_in_lake,
+        symbol_normalizer=normalize_storage_symbol,
+        interval_ms_resolver=interval_to_milliseconds,
+        now_open_resolver=_last_closed_open_ms,
+        ranges_builder=_missing_ranges_ms,
+        history_fetcher=fetch_candles_all_history,
+        range_fetcher=fetch_candles_range,
     )
-
-    interval_ms = interval_to_milliseconds(exchange=exchange, interval=timeframe)
-    end_open_ms = _last_closed_open_ms(interval_ms=interval_ms)
-    if not stored_open_times:
-        return fetch_candles_all_history(
-            exchange=exchange,
-            symbol=symbol,
-            market=market,
-            interval=timeframe,
-        )
-    if end_open_ms < int(min(stored_open_times).timestamp() * 1000):
-        return []
-
-    missing_ranges = _missing_ranges_ms(
-        existing_open_times=stored_open_times,
-        interval_ms=interval_ms,
-        end_open_ms=end_open_ms,
-    )
-    if not missing_ranges:
-        return []
-
-    fetched: list[SpotCandle] = []
-    for start_open_ms, gap_end_ms in missing_ranges:
-        fetched.extend(
-            fetch_candles_range(
-                exchange=exchange,
-                symbol=symbol,
-                interval=timeframe,
-                start_open_ms=start_open_ms,
-                end_open_ms=gap_end_ms,
-                market=market,
-            )
-        )
-
-    unique_by_open_time = {item.open_time: item for item in fetched}
-    return [unique_by_open_time[key] for key in sorted(unique_by_open_time)]
 
 
 def _fetch_symbol_open_interest(
@@ -239,55 +176,21 @@ def _fetch_symbol_open_interest(
 ) -> list[OpenInterestPoint]:
     """Fetch open-interest data for one symbol (perp only)."""
 
-    if market != "perp":
-        return []
-
-    normalized_interval = normalize_open_interest_timeframe(exchange=exchange, value=timeframe)
-    storage_symbol = normalize_storage_symbol(exchange=exchange, symbol=symbol, market=market)
-    stored_open_times = open_times_in_lake_by_dataset(
-        lake_root=lake_root,
-        dataset_type="open_interest",
-        market=market,
+    return fetch_symbol_open_interest(
         exchange=exchange,
-        symbol=storage_symbol,
-        timeframe=normalized_interval,
+        market=market,
+        symbol=symbol,
+        timeframe=timeframe,
+        lake_root=lake_root,
+        open_times_reader=open_times_in_lake_by_dataset,
+        timeframe_normalizer=normalize_open_interest_timeframe,
+        symbol_normalizer=normalize_storage_symbol,
+        interval_ms_resolver=open_interest_interval_to_milliseconds,
+        now_open_resolver=_last_closed_open_ms,
+        ranges_builder=_missing_ranges_ms,
+        history_fetcher=fetch_open_interest_all_history,
+        range_fetcher=fetch_open_interest_range,
     )
-
-    interval_ms = open_interest_interval_to_milliseconds(exchange=exchange, interval=normalized_interval)
-    end_open_ms = _last_closed_open_ms(interval_ms=interval_ms)
-    if not stored_open_times:
-        return fetch_open_interest_all_history(
-            exchange=exchange,
-            symbol=symbol,
-            interval=normalized_interval,
-            market=market,
-        )
-    if end_open_ms < int(min(stored_open_times).timestamp() * 1000):
-        return []
-
-    missing_ranges = _missing_ranges_ms(
-        existing_open_times=stored_open_times,
-        interval_ms=interval_ms,
-        end_open_ms=end_open_ms,
-    )
-    if not missing_ranges:
-        return []
-
-    fetched: list[OpenInterestPoint] = []
-    for start_open_ms, gap_end_ms in missing_ranges:
-        fetched.extend(
-            fetch_open_interest_range(
-                exchange=exchange,
-                symbol=symbol,
-                interval=normalized_interval,
-                start_open_ms=start_open_ms,
-                end_open_ms=gap_end_ms,
-                market=market,
-            )
-        )
-
-    unique_by_open_time = {item.open_time: item for item in fetched}
-    return [unique_by_open_time[key] for key in sorted(unique_by_open_time)]
 
 
 def _fetch_concurrency() -> int:
@@ -312,64 +215,17 @@ async def _fetch_candle_tasks_parallel(
 ]:
     """Fetch OHLCV tasks concurrently with bounded parallelism."""
 
-    semaphore = asyncio.Semaphore(max(1, concurrency))
-    total_tasks = len(tasks)
-
-    async def _worker(
-        idx: int,
-        task: tuple[Exchange, Market, str, str],
-    ) -> tuple[tuple[Exchange, Market, str, str], list[SpotCandle], str | None]:
-        exchange, market, symbol, timeframe = task
-        logger.info(
-            "Fetch start [%s/%s] exchange=%s market=%s symbol=%s timeframe=%s mode=%s",
-            idx,
-            total_tasks,
-            exchange,
-            market,
-            symbol,
-            timeframe,
-            "auto-bootstrap-or-gap-fill",
-        )
-        async with semaphore:
-            try:
-                candles = await asyncio.to_thread(
-                    _fetch_symbol_candles,
-                    exchange,
-                    market,
-                    symbol,
-                    timeframe,
-                    lake_root,
-                )
-                logger.info(
-                    "Fetch complete [%s/%s] exchange=%s market=%s symbol=%s timeframe=%s candles=%s",
-                    idx,
-                    total_tasks,
-                    exchange,
-                    market,
-                    symbol,
-                    timeframe,
-                    len(candles),
-                )
-                return task, candles, None
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "Fetch failed exchange=%s market=%s symbol=%s timeframe=%s",
-                    exchange,
-                    market,
-                    symbol,
-                    timeframe,
-                )
-                return task, [], str(exc)
-
-    results = await asyncio.gather(*[_worker(idx, task) for idx, task in enumerate(tasks, start=1)])
-    task_results: dict[tuple[Exchange, Market, str, str], list[SpotCandle]] = {}
-    task_errors: dict[tuple[Exchange, Market, str, str], str] = {}
-    for key, candles, error in results:
-        if error is None:
-            task_results[key] = candles
-        else:
-            task_errors[key] = error
-    return task_results, task_errors
+    service_tasks = [
+        CandleFetchTask(exchange=exchange, market=market, symbol=symbol, timeframe=timeframe)
+        for exchange, market, symbol, timeframe in tasks
+    ]
+    return await fetch_candle_tasks_parallel(
+        tasks=service_tasks,
+        lake_root=lake_root,
+        concurrency=concurrency,
+        logger=logger,
+        symbol_fetcher=_fetch_symbol_candles,
+    )
 
 
 async def _fetch_open_interest_tasks_parallel(
@@ -383,61 +239,17 @@ async def _fetch_open_interest_tasks_parallel(
 ]:
     """Fetch open-interest tasks concurrently with bounded parallelism."""
 
-    semaphore = asyncio.Semaphore(max(1, concurrency))
-    total_tasks = len(oi_tasks)
-
-    async def _worker(
-        idx: int,
-        task: tuple[Exchange, str, str],
-    ) -> tuple[tuple[Exchange, str, str], list[OpenInterestPoint], str | None]:
-        exchange, symbol, timeframe = task
-        logger.info(
-            "OI fetch start [%s/%s] exchange=%s market=oi symbol=%s timeframe=%s mode=%s",
-            idx,
-            total_tasks,
-            exchange,
-            symbol,
-            timeframe,
-            "auto-bootstrap-or-gap-fill",
-        )
-        async with semaphore:
-            try:
-                rows = await asyncio.to_thread(
-                    _fetch_symbol_open_interest,
-                    exchange,
-                    "perp",
-                    symbol,
-                    timeframe,
-                    lake_root,
-                )
-                logger.info(
-                    "OI fetch complete [%s/%s] exchange=%s symbol=%s timeframe=%s rows=%s",
-                    idx,
-                    total_tasks,
-                    exchange,
-                    symbol,
-                    timeframe,
-                    len(rows),
-                )
-                return task, rows, None
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "OI fetch failed exchange=%s symbol=%s timeframe=%s",
-                    exchange,
-                    symbol,
-                    timeframe,
-                )
-                return task, [], str(exc)
-
-    results = await asyncio.gather(*[_worker(idx, task) for idx, task in enumerate(oi_tasks, start=1)])
-    oi_results: dict[tuple[Exchange, str, str], list[OpenInterestPoint]] = {}
-    oi_errors: dict[tuple[Exchange, str, str], str] = {}
-    for key, rows, error in results:
-        if error is None:
-            oi_results[key] = rows
-        else:
-            oi_errors[key] = error
-    return oi_results, oi_errors
+    service_tasks = [
+        OpenInterestFetchTask(exchange=exchange, symbol=symbol, timeframe=timeframe)
+        for exchange, symbol, timeframe in oi_tasks
+    ]
+    return await fetch_open_interest_tasks_parallel(
+        tasks=service_tasks,
+        lake_root=lake_root,
+        concurrency=concurrency,
+        logger=logger,
+        symbol_fetcher=_fetch_symbol_open_interest,
+    )
 
 
 def _write_loader_samples(
@@ -447,82 +259,11 @@ def _write_loader_samples(
 ) -> None:
     """Write per exchange/symbol/timeframe samples and matching full-data plots."""
 
-    sample_dir = Path("samples")
-    sample_dir.mkdir(parents=True, exist_ok=True)
-
-    run_id = f"sample_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}"
-    ingested_at = datetime.now(UTC)
-
-    def _safe_name(value: str) -> str:
-        return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
-
-    for market, candle_by_exchange in candles_for_storage.items():
-        for exchange, candle_by_symbol in candle_by_exchange.items():
-            for symbol_key, candles in candle_by_symbol.items():
-                if not candles:
-                    continue
-                timeframe = candles[0].interval
-                base_name = (
-                    f"{market}_{_safe_name(exchange)}_{_safe_name(symbol_key)}_"
-                    f"{_safe_name(timeframe)}_sample_10_rows"
-                )
-                rows = [
-                    candle_record(
-                        candle=item,
-                        market=market,
-                        run_id=run_id,
-                        ingested_at=ingested_at,
-                    )
-                    for item in candles
-                ]
-                frame = pd.DataFrame(rows)
-                sample = frame.sample(n=10, replace=len(frame) < 10, random_state=42)
-                csv_path = sample_dir / f"{base_name}.csv"
-                sample.to_csv(csv_path, index=False)
-                logger.info("Sample CSV written rows=%s path=%s", len(sample), csv_path)
-
-                generated = save_candle_plots(
-                    candles_by_exchange={exchange: {symbol_key: candles}},
-                    output_dir=str(sample_dir),
-                    price_field="spot",
-                )
-                if generated:
-                    source = Path(generated[0])
-                    target = sample_dir / f"{base_name}.png"
-                    if source.resolve() != target.resolve():
-                        source.replace(target)
-                    logger.info("Sample plot written path=%s", target)
-
-    for market, oi_by_exchange in open_interest_for_storage.items():
-        for exchange, oi_by_symbol in oi_by_exchange.items():
-            for symbol_key, items in oi_by_symbol.items():
-                if not items:
-                    continue
-                timeframe = items[0].interval
-                base_name = (
-                    f"oi_{market}_{_safe_name(exchange)}_{_safe_name(symbol_key)}_{_safe_name(timeframe)}_sample_10_rows"
-                )
-                rows = [
-                    open_interest_record(item=item, market=market, run_id=run_id, ingested_at=ingested_at)
-                    for item in items
-                ]
-                frame = pd.DataFrame(rows)
-                sample = frame.sample(n=10, replace=len(frame) < 10, random_state=42)
-                csv_path = sample_dir / f"{base_name}.csv"
-                sample.to_csv(csv_path, index=False)
-                logger.info("Sample CSV written rows=%s path=%s", len(sample), csv_path)
-
-                sorted_items = sorted(items, key=lambda value: value.open_time)
-                plot_path = sample_dir / f"{base_name}.png"
-                save_open_interest_plot(
-                    exchange=exchange,
-                    symbol=symbol_key,
-                    interval=timeframe,
-                    times=[item.open_time for item in sorted_items],
-                    open_interest_values=[item.open_interest for item in sorted_items],
-                    output_path=str(plot_path),
-                )
-                logger.info("Sample plot written path=%s", plot_path)
+    write_loader_samples(
+        candles_for_storage=candles_for_storage,
+        open_interest_for_storage=open_interest_for_storage,
+        logger=logger,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -532,11 +273,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     spot_parser = subparsers.add_parser("loader", help="Fetch candles from supported exchanges")
-    spot_parser.add_argument("--exchange", choices=["binance", "deribit", "bybit"], default="binance")
+    spot_parser.add_argument("--exchange", choices=["deribit"], default="deribit")
     spot_parser.add_argument(
         "--exchanges",
         nargs="+",
-        choices=["binance", "deribit", "bybit"],
+        choices=["deribit"],
         help="Optional list of exchanges to fetch in one run",
     )
     spot_parser.add_argument(
@@ -544,7 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         choices=["spot", "perp", "oi"],
         default=["spot"],
-        help="One or more market modes to fetch, e.g. --market spot perp oi",
+        help="One or more data types to fetch, e.g. --market spot perp oi",
     )
     spot_parser.add_argument(
         "--symbols",
@@ -604,11 +345,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     tf_parser = subparsers.add_parser("list-spot-timeframes", help="List exchange-supported candle timeframes")
-    tf_parser.add_argument("--exchange", choices=["binance", "deribit", "bybit"], default="binance")
+    tf_parser.add_argument("--exchange", choices=["deribit"], default="deribit")
     tf_parser.add_argument(
         "--exchanges",
         nargs="+",
-        choices=["binance", "deribit", "bybit"],
+        choices=["deribit"],
         help="Optional list of exchanges to list in one run",
     )
 
@@ -623,7 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip TimescaleDB schema/table bootstrap and write into existing tables",
     )
-    ingest_parser.add_argument("--exchanges", nargs="+", choices=["binance", "deribit", "bybit"])
+    ingest_parser.add_argument("--exchanges", nargs="+", choices=["deribit"])
     ingest_parser.add_argument("--symbols", nargs="+", help="Optional symbol filter")
     ingest_parser.add_argument("--timeframes", nargs="+", help="Optional timeframe filter")
     ingest_parser.add_argument(
@@ -634,6 +375,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ingest_parser.add_argument("--no-json-output", action="store_true", help="Suppress JSON output")
 
+    stats_parser = subparsers.add_parser(
+        "export-descriptive-stats",
+        help="Export reproducible OHLCV descriptive statistics from parquet lake",
+    )
+    stats_parser.add_argument("--lake-root", default="lake/bronze", help="Root directory for parquet lake files")
+    stats_parser.add_argument("--output-csv", default="docs/tables/descriptive_stats_baseline.csv")
+    stats_parser.add_argument("--start-time", default="2026-01-01T00:00:00+00:00")
+    stats_parser.add_argument("--end-time", default="2026-01-31T23:59:59+00:00")
+    stats_parser.add_argument("--exchanges", nargs="+", choices=["deribit"])
+    stats_parser.add_argument("--symbols", nargs="+", help="Optional symbol filter")
+    stats_parser.add_argument("--timeframes", nargs="+", help="Optional timeframe filter")
+    stats_parser.add_argument(
+        "--instrument-types",
+        nargs="+",
+        choices=["spot", "perp"],
+        default=["spot", "perp"],
+    )
+    stats_parser.add_argument("--no-json-output", action="store_true", help="Suppress JSON output")
+
     return parser
 
 
@@ -643,10 +403,10 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
     try:
         with SingleInstanceLock(".run/crypto-l2-loader.lock"):
             exchanges = cast(list[Exchange], args.exchanges if args.exchanges else [args.exchange])
-            cli_markets = cast(list[CliMarket], args.market)
-            ohlcv_markets = [item for item in cli_markets if item in {"spot", "perp"}]
-            oi_requested = "oi" in cli_markets
-            multi_market = len(cli_markets) > 1
+            data_types = cast(list[DataType], args.market)
+            ohlcv_markets = [item for item in data_types if item in {"spot", "perp"}]
+            oi_requested = "oi" in data_types
+            multi_market = len(data_types) > 1
             requested_timeframes = cast(list[str], args.timeframes if args.timeframes else [args.timeframe])
             multi_timeframe = len(requested_timeframes) > 1
             output: dict[str, object] = {}
@@ -773,38 +533,36 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
 
             if args.save_parquet_lake:
                 try:
-                    parquet_files: list[str] = []
-                    for market_key, candles_by_exchange in candles_for_storage.items():
-                        parquet_files.extend(
-                            save_spot_candles_parquet_lake(
-                                candles_by_exchange=candles_by_exchange,
-                                market=market_key,
-                                lake_root=args.lake_root,
-                            )
-                        )
-                    if oi_requested:
-                        for market_key, oi_by_exchange in open_interest_for_storage.items():
-                            parquet_files.extend(
-                                save_open_interest_parquet_lake(
-                                    open_interest_by_exchange=oi_by_exchange,
-                                    market=market_key,
-                                    lake_root=args.lake_root,
-                                )
-                            )
-                    output["_parquet_files"] = parquet_files
+                    storage_output = persist_loader_outputs(
+                        candles_for_storage=candles_for_storage,
+                        open_interest_for_storage=open_interest_for_storage,
+                        save_parquet_lake=True,
+                        save_timescaledb=False,
+                        lake_root=cast(str, args.lake_root),
+                        timescaledb_schema=cast(str, args.timescaledb_schema),
+                        create_schema=not bool(args.timescaledb_no_bootstrap),
+                        oi_requested=oi_requested,
+                        save_tsdb_fn=save_market_data_to_timescaledb,
+                    )
+                    output.update(storage_output)
                 except Exception as exc:  # noqa: BLE001
                     output["_parquet_error"] = str(exc)
                     logger.exception("Parquet lake write failed")
 
             if args.save_timescaledb:
                 try:
-                    tsdb_summary = save_market_data_to_timescaledb(
+                    storage_output = persist_loader_outputs(
                         candles_for_storage=candles_for_storage,
                         open_interest_for_storage=open_interest_for_storage,
-                        schema=cast(str, args.timescaledb_schema),
+                        save_parquet_lake=False,
+                        save_timescaledb=True,
+                        lake_root=cast(str, args.lake_root),
+                        timescaledb_schema=cast(str, args.timescaledb_schema),
                         create_schema=not bool(args.timescaledb_no_bootstrap),
+                        oi_requested=oi_requested,
+                        save_tsdb_fn=save_market_data_to_timescaledb,
                     )
-                    output["_timescaledb"] = tsdb_summary
+                    output.update(storage_output)
                 except Exception as exc:  # noqa: BLE001
                     output["_timescaledb_error"] = str(exc)
                     logger.exception("TimescaleDB write failed")
@@ -893,6 +651,65 @@ def _run_list_spot_timeframes(args: argparse.Namespace, logger: logging.Logger) 
     logger.info("Command complete: list-spot-timeframes")
 
 
+def _run_export_descriptive_stats(args: argparse.Namespace, logger: logging.Logger) -> None:
+    """Export deterministic descriptive statistics table from parquet-lake OHLCV rows."""
+
+    start_time = datetime.fromisoformat(cast(str, args.start_time))
+    end_time = datetime.fromisoformat(cast(str, args.end_time))
+    if start_time.tzinfo is None or end_time.tzinfo is None:
+        raise ValueError("start-time and end-time must include timezone offset (for example +00:00)")
+    if start_time > end_time:
+        raise ValueError("start-time must be <= end-time")
+
+    dataframe = load_combined_dataframe_from_lake(
+        lake_root=cast(str, args.lake_root),
+        exchanges=cast(list[str] | None, args.exchanges),
+        symbols=cast(list[str] | None, args.symbols),
+        timeframes=cast(list[str] | None, args.timeframes),
+        instrument_types=cast(list[str] | None, args.instrument_types),
+        start_time=start_time,
+        end_time=end_time,
+        include_open_interest=False,
+    )
+
+    stats_variables = ["open", "high", "low", "close", "volume"]
+    records: list[dict[str, object]] = []
+    for variable in stats_variables:
+        if variable not in dataframe.columns:
+            records.append({"Variable": variable, "Mean": None, "Std": None, "Min": None, "Max": None})
+            continue
+        series = dataframe[variable].astype("float64")
+        records.append(
+            {
+                "Variable": variable,
+                "Mean": float(series.mean()) if len(series) else None,
+                "Std": float(series.std()) if len(series) else None,
+                "Min": float(series.min()) if len(series) else None,
+                "Max": float(series.max()) if len(series) else None,
+            }
+        )
+
+    stats_df = pd.DataFrame(records, columns=["Variable", "Mean", "Std", "Min", "Max"])
+    output_path = Path(cast(str, args.output_csv))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_df.to_csv(output_path, index=False)
+
+    result = {
+        "output_csv": str(output_path.resolve()),
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+        "row_count": int(len(dataframe)),
+        "variables": stats_variables,
+    }
+    if not bool(args.no_json_output):
+        print(json.dumps(result, indent=2))
+    logger.info(
+        "Command complete: export-descriptive-stats rows=%s output=%s",
+        len(dataframe),
+        output_path,
+    )
+
+
 def main() -> None:
     """CLI entrypoint."""
 
@@ -922,6 +739,8 @@ def main() -> None:
             summary["ohlcv_rows"],
             summary["open_interest_rows"],
         )
+    elif args.command == "export-descriptive-stats":
+        _run_export_descriptive_stats(args=args, logger=logger)
 
 
 if __name__ == "__main__":
