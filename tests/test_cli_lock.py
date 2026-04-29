@@ -14,6 +14,7 @@ import pytest
 
 from api import cli
 from api.cli import SingleInstanceError, SingleInstanceLock
+from ingestion.l2 import L2MinuteBar
 from ingestion.open_interest import OpenInterestPoint
 from ingestion.spot import SpotCandle
 
@@ -287,3 +288,77 @@ def test_export_descriptive_stats_writes_csv(monkeypatch: pytest.MonkeyPatch, tm
     written = pd.read_csv(output_csv)
     assert list(written.columns) == ["Variable", "Mean", "Std", "Min", "Max"]
     assert set(written["Variable"]) == {"open", "high", "low", "close", "volume"}
+
+
+def test_main_loader_l2_m1_command_saves_parquet(monkeypatch: pytest.MonkeyPatch) -> None:
+    class NoopLock:
+        def __init__(self, lock_path: str) -> None:
+            del lock_path
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            del exc_type, exc, tb
+
+    captured: dict[str, object] = {}
+    row = L2MinuteBar(
+        minute_ts=datetime(2026, 4, 29, 10, 0, tzinfo=UTC),
+        exchange="deribit",
+        symbol="BTC-PERPETUAL",
+        snapshot_count=10,
+        mid_open=100.0,
+        mid_high=101.0,
+        mid_low=99.0,
+        mid_close=100.5,
+        mark_close=100.4,
+        index_close=100.3,
+        spread_bps_mean=10.0,
+        spread_bps_max=12.0,
+        spread_bps_last=11.0,
+        bid_depth_1_mean=10.0,
+        ask_depth_1_mean=11.0,
+        bid_depth_10_mean=100.0,
+        ask_depth_10_mean=110.0,
+        bid_depth_50_mean=500.0,
+        ask_depth_50_mean=510.0,
+        imbalance_1_mean=0.1,
+        imbalance_10_mean=0.2,
+        imbalance_50_mean=0.3,
+        imbalance_10_last=0.25,
+        imbalance_50_last=0.35,
+        microprice_close=100.45,
+        microprice_minus_mid_mean=0.01,
+        bid_vwap_10_mean=99.5,
+        ask_vwap_10_mean=101.5,
+        open_interest_last=1000.0,
+        funding_8h_last=0.0001,
+        current_funding_last=0.00001,
+    )
+
+    monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
+    monkeypatch.setattr(cli, "fetch_l2_snapshots", lambda **kwargs: [object()])
+    monkeypatch.setattr(cli, "aggregate_snapshots_to_m1", lambda snapshots: [row])
+    monkeypatch.setattr(
+        cli,
+        "save_l2_m1_parquet_lake",
+        lambda **kwargs: captured.update(kwargs) or ["/tmp/l2.parquet"],
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "main.py",
+            "loader-l2-m1",
+            "--exchange",
+            "deribit",
+            "--symbols",
+            "BTC",
+            "--snapshot-count",
+            "2",
+            "--save-parquet-lake",
+            "--no-json-output",
+        ],
+    )
+
+    cli.main()
+    assert captured["lake_root"] == "lake/bronze"

@@ -13,6 +13,7 @@ Many practical pipelines fail due to exchange-specific one-off scripts, inconsis
 This project proposes a modular ingestion architecture with typed interfaces, explicit normalization, and reproducible command-line workflows focused on Deribit as the current production exchange.
 
 The contributions of this stage are: (1) Deribit OHLCV normalization, (2) parquet-lake persistence paths, and (3) tested operational workflows for repeatable data acquisition.
+The repository now also includes Deribit perpetual L2 snapshot ingestion aggregated into M1 microstructure feature bars for downstream model development.
 
 ## Literature Review
 Volatility clustering and regime dependence motivate robust historical market-data pipelines. ARCH/GARCH foundations establish heteroskedastic behavior in financial time series, requiring high-integrity timestamped observations (Engle, 1982; Bollerslev, 1986). Regime-switching frameworks further highlight sensitivity to data quality and temporal consistency (Hamilton, 1989). Later work on high-frequency econometrics and realized-volatility estimation reinforces the need for reliable, granular data ingestion and synchronization processes (Andersen et al., 2001; Barndorff-Nielsen and Shephard, 2002).
@@ -89,6 +90,12 @@ CLI -> Application Service Layer (gapfill_service, fetch_service)
     -> Normalized SpotCandle/OpenInterestPoint -> Parquet Lake/TimescaleDB
 ```
 
+L2 extension path:
+
+```text
+CLI (loader-l2-m1) -> Deribit L2 Adapter -> L2Snapshot -> M1 feature aggregation -> Parquet Lake
+```
+
 Storage and artifact side effects are also routed through dedicated services (`storage_service`, `artifact_service`) to keep CLI logic thin and testable. Canonical CLI-to-storage naming (`spot`/`perp`/`oi` -> `dataset_type` + `instrument_type`) is formalized in `application/schema.py`.
 
 ### Core Mapping
@@ -162,6 +169,7 @@ No predictive or regime models are trained in this stage.
 | Loader sample artifacts | Per market/exchange/symbol/timeframe CSV + full-history plot | Passed with deterministic naming |
 | Chunked Timescale ingest | Streaming parquet read + bounded DB upsert batches | Passed with stable memory profile |
 | Open-interest integration | Deribit perp dataset_type=open_interest | Passed for all-history and gap-fill paths |
+| L2 M1 aggregation | Deribit perp orderbook snapshots -> M1 feature bars | Passed via aggregation and parquet tests (`tests/test_l2.py`, `tests/test_l2_adapter.py`, `tests/test_lake.py`) |
 
 ### Figures
 Figure 1. OHLCV Spot series (Deribit BTCUSDT 1m).

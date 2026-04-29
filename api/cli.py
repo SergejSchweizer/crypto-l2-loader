@@ -46,6 +46,7 @@ from ingestion.funding import (
     funding_interval_to_milliseconds,
     normalize_funding_timeframe,
 )
+from ingestion.l2 import L2MinuteBar, aggregate_snapshots_to_m1, fetch_l2_snapshots
 from ingestion.lake import (
     load_combined_dataframe_from_lake,
     load_funding_from_lake,
@@ -53,6 +54,7 @@ from ingestion.lake import (
     load_spot_candles_from_lake,
     open_times_in_lake,
     open_times_in_lake_by_dataset,
+    save_l2_m1_parquet_lake,
 )
 from ingestion.open_interest import (
     OpenInterestPoint,
@@ -396,6 +398,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=["spot", "perp"],
     )
     stats_parser.add_argument("--no-json-output", action="store_true", help="Suppress JSON output")
+
+    l2_parser = subparsers.add_parser(
+        "loader-l2-m1",
+        help="Fetch Deribit L2 snapshots and aggregate features to minute bars",
+    )
+    l2_parser.add_argument("--exchange", choices=["deribit"], default="deribit")
+    l2_parser.add_argument("--symbols", nargs="+", default=["BTC", "ETH"])
+    l2_parser.add_argument("--levels", type=int, default=50, help="Number of book levels per side to request")
+    l2_parser.add_argument("--snapshot-count", type=int, default=60, help="Snapshots per symbol to collect")
+    l2_parser.add_argument("--poll-interval-s", type=float, default=1.0, help="Sleep interval between snapshots")
+    l2_parser.add_argument("--lake-root", default="lake/bronze", help="Root directory for parquet lake files")
+    l2_parser.add_argument(
+        "--save-parquet-lake",
+        action="store_true",
+        help="Save aggregated L2 M1 rows to parquet lake partitions",
+    )
+    l2_parser.add_argument("--no-json-output", action="store_true", help="Suppress JSON output")
 
     return parser
 
@@ -813,6 +832,84 @@ def _run_list_spot_timeframes(args: argparse.Namespace, logger: logging.Logger) 
     logger.info("Command complete: list-spot-timeframes")
 
 
+def _serialize_l2_row(item: L2MinuteBar) -> dict[str, object]:
+    """Convert L2 M1 row into JSON-safe output dictionary."""
+
+    return {
+        "minute_ts": item.minute_ts.isoformat(),
+        "exchange": item.exchange,
+        "symbol": item.symbol,
+        "snapshot_count": item.snapshot_count,
+        "mid_open": item.mid_open,
+        "mid_high": item.mid_high,
+        "mid_low": item.mid_low,
+        "mid_close": item.mid_close,
+        "mark_close": item.mark_close,
+        "index_close": item.index_close,
+        "spread_bps_mean": item.spread_bps_mean,
+        "spread_bps_max": item.spread_bps_max,
+        "spread_bps_last": item.spread_bps_last,
+        "bid_depth_1_mean": item.bid_depth_1_mean,
+        "ask_depth_1_mean": item.ask_depth_1_mean,
+        "bid_depth_10_mean": item.bid_depth_10_mean,
+        "ask_depth_10_mean": item.ask_depth_10_mean,
+        "bid_depth_50_mean": item.bid_depth_50_mean,
+        "ask_depth_50_mean": item.ask_depth_50_mean,
+        "imbalance_1_mean": item.imbalance_1_mean,
+        "imbalance_10_mean": item.imbalance_10_mean,
+        "imbalance_50_mean": item.imbalance_50_mean,
+        "imbalance_10_last": item.imbalance_10_last,
+        "imbalance_50_last": item.imbalance_50_last,
+        "microprice_close": item.microprice_close,
+        "microprice_minus_mid_mean": item.microprice_minus_mid_mean,
+        "bid_vwap_10_mean": item.bid_vwap_10_mean,
+        "ask_vwap_10_mean": item.ask_vwap_10_mean,
+        "open_interest_last": item.open_interest_last,
+        "funding_8h_last": item.funding_8h_last,
+        "current_funding_last": item.current_funding_last,
+    }
+
+
+def _run_loader_l2_m1(args: argparse.Namespace, logger: logging.Logger) -> None:
+    """Run L2 snapshot collection and M1 aggregation command."""
+
+    try:
+        with SingleInstanceLock(".run/crypto-l2-loader-l2.lock"):
+            exchange = cast(Exchange, args.exchange)
+            output: dict[str, object] = {exchange: {}}
+            rows_by_exchange: dict[str, dict[str, list[L2MinuteBar]]] = {exchange: {}}
+
+            for symbol in cast(list[str], args.symbols):
+                snapshots = fetch_l2_snapshots(
+                    exchange=exchange,
+                    symbol=symbol,
+                    depth=int(args.levels),
+                    snapshot_count=int(args.snapshot_count),
+                    poll_interval_s=float(args.poll_interval_s),
+                )
+                rows = aggregate_snapshots_to_m1(snapshots)
+                symbol_key = symbol.upper()
+                cast(dict[str, object], output[exchange])[symbol_key] = [_serialize_l2_row(item) for item in rows]
+                rows_by_exchange[exchange][symbol_key] = rows
+
+            if bool(args.save_parquet_lake):
+                try:
+                    output["_parquet_files"] = save_l2_m1_parquet_lake(
+                        rows_by_exchange=rows_by_exchange,
+                        lake_root=cast(str, args.lake_root),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    output["_parquet_error"] = str(exc)
+                    logger.exception("L2 M1 parquet write failed")
+
+            if not bool(args.no_json_output):
+                print(json.dumps(output, indent=2))
+            logger.info("Command complete: loader-l2-m1")
+    except SingleInstanceError as exc:
+        logger.warning("Single-instance lock active for L2 loader")
+        raise SystemExit(str(exc)) from exc
+
+
 def _run_export_descriptive_stats(args: argparse.Namespace, logger: logging.Logger) -> None:
     """Export deterministic descriptive statistics table from parquet-lake OHLCV rows."""
 
@@ -903,6 +1000,8 @@ def main() -> None:
         )
     elif args.command == "export-descriptive-stats":
         _run_export_descriptive_stats(args=args, logger=logger)
+    elif args.command == "loader-l2-m1":
+        _run_loader_l2_m1(args=args, logger=logger)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ This repository provides a modular framework for ingesting crypto market data wi
 Current implemented scope (Step 1):
 - Pull BTC/ETH data from Deribit public APIs for `spot`, `perp`, `oi`, and `funding`.
 - Expose a CLI command for repeatable loader runs.
+- Ingest Deribit perp L2 snapshots and aggregate to 1-minute (`M1`) microstructure feature bars.
 
 Scope note:
 - The repository name keeps the long-term direction (`crypto-l2-loader`), while the current production implementation is Deribit-only OHLCV + OI + funding ingestion. L2 order book ingestion is planned future scope.
@@ -61,6 +62,8 @@ Core dependencies are managed through `pyproject.toml` and include:
 - `ingestion/exchanges/deribit_funding.py`: Deribit funding-rate adapter.
 - `ingestion/lake.py`: parquet lake read/write and partition utility functions.
 - `ingestion/plotting.py`: chart rendering for loaded price/volume/open-interest/funding data.
+- `ingestion/l2.py`: Deribit perp L2 snapshot collection and M1 feature aggregation.
+- `ingestion/exchanges/deribit_l2.py`: Deribit L2 orderbook adapter.
 
 ### 5.3 API Layer
 - `api/cli.py`: CLI command registration, argument parsing, orchestration entrypoint, and JSON output formatting.
@@ -315,6 +318,12 @@ Fetch OHLCV (spot+perp), open interest, and funding in one run:
 
 ```bash
 python3 main.py loader --exchange deribit --market spot perp oi funding --symbols BTC ETH --timeframe 5m --save-parquet-lake --lake-root lake/bronze
+```
+
+Fetch L2 snapshots and aggregate/store M1 feature bars:
+
+```bash
+python3 main.py loader-l2-m1 --exchange deribit --symbols BTC ETH --levels 50 --snapshot-count 120 --poll-interval-s 0.5 --save-parquet-lake --lake-root lake/bronze
 ```
 
 Parquet lake write mode uses a stable file per partition (`data.parquet`) with staged merge+rewrite on each run to keep file counts bounded. Partition schema:
