@@ -12,7 +12,25 @@ from ingestion.spot import Exchange, Market, interval_to_milliseconds, normalize
 
 @dataclass(frozen=True)
 class FundingPoint:
-    """Funding-rate datapoint for one instrument interval."""
+    """Funding-rate datapoint for one instrument interval.
+
+    Example:
+        ```python
+        from datetime import UTC, datetime
+        from ingestion.funding import FundingPoint
+
+        point = FundingPoint(
+            exchange="deribit",
+            symbol="ETH-PERPETUAL",
+            interval="1h",
+            open_time=datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+            close_time=datetime(2026, 1, 1, 0, 59, 59, 999000, tzinfo=UTC),
+            funding_rate=0.0001,
+            index_price=3200.0,
+            mark_price=3205.0,
+        )
+        ```
+    """
 
     exchange: str
     symbol: str
@@ -107,4 +125,3 @@ def fetch_funding_range(
         )
         for item in parsed
     ]
-

@@ -12,7 +12,24 @@ from ingestion.spot import Exchange, Market, interval_to_milliseconds, normalize
 
 @dataclass(frozen=True)
 class OpenInterestPoint:
-    """Open-interest datapoint for one instrument interval."""
+    """Open-interest datapoint for one instrument interval.
+
+    Example:
+        ```python
+        from datetime import UTC, datetime
+        from ingestion.open_interest import OpenInterestPoint
+
+        point = OpenInterestPoint(
+            exchange="deribit",
+            symbol="BTC-PERPETUAL",
+            interval="1m",
+            open_time=datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+            close_time=datetime(2026, 1, 1, 0, 0, 59, 999000, tzinfo=UTC),
+            open_interest=12345.0,
+            open_interest_value=0.0,
+        )
+        ```
+    """
 
     exchange: str
     symbol: str

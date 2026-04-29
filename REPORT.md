@@ -135,11 +135,11 @@ The table artifact is versioned at `docs/tables/descriptive_stats_baseline.csv`.
 
 | Variable | Mean | Std | Min | Max |
 |---|---:|---:|---:|---:|
-| Open | N/A (config-dependent) | N/A | N/A | N/A |
-| High | N/A (config-dependent) | N/A | N/A | N/A |
-| Low | N/A (config-dependent) | N/A | N/A | N/A |
-| Close | N/A (config-dependent) | N/A | N/A | N/A |
-| Volume | N/A (config-dependent) | N/A | N/A | N/A |
+| Open | 46841.1872 | 43831.9162 | 2227.7600 | 97864.0000 |
+| High | 46851.7766 | 43841.3161 | 2334.2000 | 97967.5000 |
+| Low | 46830.4322 | 43822.3768 | 2202.4000 | 97767.0000 |
+| Close | 46841.0247 | 43831.7922 | 2235.7000 | 97874.0000 |
+| Volume | 380.8441 | 2277.7764 | 0.0000 | 325858.1960 |
 
 ### Model Comparison Table
 No predictive or regime models are trained in this stage.
@@ -176,17 +176,17 @@ Figure 2. OHLCV Perp series (Deribit ETHUSDT 1m).
 
 Interpretation: Figure 2 indicates perp candle compatibility within the same normalized OHLCV pipeline.
 
-Figure 3. Exchange-specific mapping quality (Deribit BTCUSDT alias path).
+Figure 3. OHLCV Spot series (historical comparison artifact outside current production adapter scope).
 
-![Figure 3: Deribit BTCUSDT 1m close](docs/figures/plot_outputs/deribit_BTCUSDT_1m_close.png)
+![Figure 3: Binance BTCUSDT 1m close](docs/figures/plot_outputs/binance_BTCUSDT_1m_close.png)
 
-Interpretation: Figure 3 supports correctness of symbol mapping and timestamp handling.
+Interpretation: Figure 3 is retained as a historical artifact for visual comparison only; it is not evidence of active Binance ingestion support in the current production codebase.
 
-Figure 4. Exchange-specific mapping quality (Deribit ETHUSDT alias path).
+Figure 4. OHLCV Spot series (historical comparison artifact outside current production adapter scope).
 
-![Figure 4: Deribit ETHUSDT 1m close](docs/figures/plot_outputs/deribit_ETHUSDT_1m_close.png)
+![Figure 4: Binance ETHUSDT 1m close](docs/figures/plot_outputs/binance_ETHUSDT_1m_close.png)
 
-Interpretation: Figure 4 confirms consistent behavior across multiple symbols on Deribit mappings.
+Interpretation: Figure 4 is similarly retained as historical context and does not indicate current non-Deribit runtime support.
 
 Figure 5. Open Interest time-series (loader sample artifact per market/exchange/symbol/timeframe).
 
@@ -197,7 +197,7 @@ Interpretation: Figure 5 tracks contract participation dynamics and complements 
 ## Discussion
 Business implications: a reliable ingestion substrate lowers operational risk for strategy research and accelerates feature engineering, backtesting, and monitoring deployment.
 
-Limitations: current scope is OHLCV-only; L2 order book, funding, and trade-level feeds are not yet integrated. Exchange-specific outages and schema changes still require active maintenance.
+Limitations: current scope includes OHLCV, open-interest, and funding for Deribit, but not L2 order book or trade-level feeds. Exchange-specific outages and schema changes still require active maintenance.
 
 Model weaknesses/assumptions: this stage does not perform inference; assumptions are engineering assumptions (timestamp consistency, endpoint availability, and exchange-provided data correctness).
 
@@ -218,5 +218,6 @@ This baseline establishes a reproducible and extensible ingestion pipeline for D
 5. Barndorff-Nielsen, O. E., and Shephard, N. (2002). Econometric Analysis of Realised Volatility and Its Use in Estimating Stochastic Volatility Models. *Journal of the Royal Statistical Society: Series B*.
 6. Deribit API Documentation. TradingView Chart Data Endpoint.
 7. Deribit API Documentation. Historical Settlement/Open Interest Endpoint.
+8. Deribit API Documentation. Funding Rate History Endpoint.
 9. Apache Arrow Documentation. Parquet RecordBatch Processing.
 10. Cont, R. (2001). Empirical Properties of Asset Returns: Stylized Facts and Statistical Issues. *Quantitative Finance*.

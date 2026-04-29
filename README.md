@@ -53,7 +53,7 @@ Core dependencies are managed through `pyproject.toml` and include:
 
 ### 5.2 Ingestion Layer
 - `ingestion/http_client.py`: lightweight JSON HTTP utilities.
-- `ingestion/spot.py`: exchange-agnostic candle load/normalization interface.
+- `ingestion/spot.py`: Deribit candle load/normalization interface for `spot` and `perp`.
 - `ingestion/open_interest.py`: open-interest load/normalization interface for perpetual instruments.
 - `ingestion/funding.py`: funding-rate load/normalization interface for perpetual instruments.
 - `ingestion/exchanges/deribit.py`: Deribit adapter with symbol and timeframe mapping.
@@ -229,6 +229,9 @@ Exchange coverage:
 | Exchange | Spot | Perp | OI | Funding | Notes |
 |---|---|---|---|---|---|
 | Deribit | Yes | Yes | Yes | Yes | Spot maps to instruments like `BTC_USDC`; perp maps to `BTC-PERPETUAL`. |
+
+Current production note:
+- The ingestion runtime supports Deribit only. Any non-Deribit sample artifacts are historical comparison outputs and not active adapter coverage.
 
 ### 5.3 Perpetual Field Mapping (Deribit Origin -> Storage)
 

@@ -24,6 +24,8 @@ The repository should always be maintainable by another engineer without requiri
 
 All projects must follow modular separation.
 
+With every major change, agents must analyze the whole project and proactively identify and implement maintainability, quality, and extensibility improvements where appropriate.
+
 ```text
 project/
 |-- ingestion/
