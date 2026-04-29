@@ -5,11 +5,11 @@
 This repository provides a modular framework for ingesting crypto market data with emphasis on reproducibility and production quality.
 
 Current implemented scope (Step 1):
-- Pull BTC/ETH candles from Deribit public APIs for spot/perp markets.
+- Pull BTC/ETH data from Deribit public APIs for `spot`, `perp`, `oi`, and `funding`.
 - Expose a CLI command for repeatable loader runs.
 
 Scope note:
-- The repository name keeps the long-term direction (`crypto-l2-loader`), while the current production implementation is Deribit-only OHLCV + OI ingestion. L2 order book ingestion is planned future scope.
+- The repository name keeps the long-term direction (`crypto-l2-loader`), while the current production implementation is Deribit-only OHLCV + OI + funding ingestion. L2 order book ingestion is planned future scope.
 
 ## 2. Architecture Diagram
 
@@ -43,18 +43,30 @@ Core dependencies are managed through `pyproject.toml` and include:
 
 ## 5. Module Explanations
 
-- `ingestion/http_client.py`: lightweight JSON HTTP utilities.
-- `ingestion/spot.py`: exchange-agnostic candle load/normalization interface.
-- `ingestion/exchanges/deribit.py`: Deribit adapter with symbol and timeframe mapping.
-- `ingestion/plotting.py`: chart rendering for loaded price and volume data.
-- `ingestion/lake.py`: parquet lake writer for partitioned candle datasets.
+### 5.1 Application Layer
+- `application/dto.py`: shared DTO definitions for fetch/storage/artifact service boundaries.
+- `application/schema.py`: canonical contract mapping for CLI data types to storage `dataset_type` + `instrument_type`.
 - `application/services/gapfill_service.py`: pure time/gap range helpers used by loader synchronization logic.
 - `application/services/fetch_service.py`: fetch orchestration service (task DTOs + parallel execution + symbol-level bootstrap/gap-fill fetch).
 - `application/services/storage_service.py`: orchestration for parquet-lake and TimescaleDB persistence side effects.
 - `application/services/artifact_service.py`: sample CSV/plot artifact generation service.
-- `application/schema.py`: canonical contract mapping for CLI data types to storage `dataset_type` + `instrument_type`.
-- `api/cli.py`: thin CLI command registration, argument parsing, and output formatting layer.
-- `infra/`: infrastructure and runtime scaffolding.
+
+### 5.2 Ingestion Layer
+- `ingestion/http_client.py`: lightweight JSON HTTP utilities.
+- `ingestion/spot.py`: exchange-agnostic candle load/normalization interface.
+- `ingestion/open_interest.py`: open-interest load/normalization interface for perpetual instruments.
+- `ingestion/funding.py`: funding-rate load/normalization interface for perpetual instruments.
+- `ingestion/exchanges/deribit.py`: Deribit adapter with symbol and timeframe mapping.
+- `ingestion/exchanges/deribit_open_interest.py`: Deribit open-interest adapter.
+- `ingestion/exchanges/deribit_funding.py`: Deribit funding-rate adapter.
+- `ingestion/lake.py`: parquet lake read/write and partition utility functions.
+- `ingestion/plotting.py`: chart rendering for loaded price/volume/open-interest/funding data.
+
+### 5.3 API Layer
+- `api/cli.py`: CLI command registration, argument parsing, orchestration entrypoint, and JSON output formatting.
+
+### 5.4 Infrastructure Layer
+- `infra/timescaledb/sink.py`: TimescaleDB schema bootstrap and idempotent upsert sink for OHLCV/OI/funding.
 
 ### 5.0 Canonical Data Type Naming
 
@@ -65,10 +77,12 @@ Use these names consistently in code, CLI usage, and documentation:
 | Spot candles | `spot` | Cash/spot OHLCV candles. |
 | Perpetual candles | `perp` | Perpetual futures/swap OHLCV candles. |
 | Open interest | `oi` | Open-interest time series for perpetual instruments. |
+| Funding rate | `funding` | Perpetual funding-rate time series for perpetual instruments. |
 
 Naming rules:
-- Use `spot`, `perp`, and `oi` as the only user-facing data-type names.
+- Use `spot`, `perp`, `oi`, and `funding` as the user-facing data-type names.
 - `dataset_type=open_interest` is the storage-layer parquet label for `oi`.
+- `dataset_type=funding` is the storage-layer parquet label for `funding`.
 
 ### 5.0.1 Data Type Purpose And Meaning
 
@@ -95,6 +109,14 @@ Naming rules:
   `oi` represents open-interest time series aligned to perpetual instruments and intervals.
 - Typical usage:
   Position build-up/unwind detection, confirmation/divergence checks with `perp` price action.
+
+#### `funding`
+- Why this data exists:
+  Funding captures the periodic transfer mechanism that anchors perpetual prices to spot.
+- Meaning:
+  `funding` represents time-bucketed perpetual funding-rate observations.
+- Typical usage:
+  Carry analysis, perp crowding diagnostics, and regime filters for derivatives positioning.
 
 ### 5.1 Data Dictionary
 
@@ -161,17 +183,32 @@ Loaded candle variables (`SpotCandle`):
     - `open_interest = float(position)`.
     - `open_interest_value = 0.0` (not provided by adapter source payload).
 
+#### `funding` dataset (`dataset_type=funding`, `instrument_type=perp`)
+- Meaning:
+  Time-bucketed funding-rate observations for perpetual instruments.
+- Availability rule:
+  Collected only when market context is `perp`; requesting `funding` for `spot` returns no rows by design.
+- Canonical normalized variables:
+  `open_time`, `close_time`, `funding_rate`, `index_price`, `mark_price`.
+- Computation in pipeline:
+  - `open_time` is parsed from exchange timestamp and converted to UTC.
+  - `close_time = open_time + timeframe_ms - 1` (inclusive interval boundary).
+  - `funding_rate` is taken from exchange funding-rate field for the interval.
+  - `index_price` and `mark_price` are propagated from exchange payload when available.
+- Exchange-specific funding mapping:
+  - Deribit (`/api/v2/public/get_funding_rate_history`): records are parsed and bucketed to the requested timeframe, then stored as normalized funding rows.
+
 Parquet row metadata fields:
 
 | Variable | Type | Description |
 |---|---|---|
 | `schema_version` | `str` | Version marker for row schema evolution (`v1` currently). |
-| `dataset_type` | `str` | Dataset family label (`ohlcv`). |
+| `dataset_type` | `str` | Dataset family label (`ohlcv`, `open_interest`, or `funding`). |
 | `instrument_type` | `str` | Market class used for loading (`spot` or `perp`). |
 | `event_time` | `datetime (UTC)` | Canonical event timestamp for the row (currently aligned to `open_time`). |
 | `ingested_at` | `datetime (UTC)` | Wall-clock timestamp when the row was written by the pipeline. |
 | `run_id` | `str` | Unique ingestion execution identifier for traceability. |
-| `source_endpoint` | `str` | Exchange endpoint group used to produce the row (`public_market_data` currently). |
+| `source_endpoint` | `str` | Exchange endpoint group used to produce the row (`public_market_data`, `public_open_interest`, or `public_funding`). |
 | `timeframe` | `str` | Storage timeframe field (same semantic meaning as `interval`). |
 | `open`, `high`, `low`, `close` | `float` | Parquet OHLC aliases mapped from candle prices. |
 | `extra` | `json/object` | Full normalized candle payload snapshot for reproducibility/debugging. |
@@ -185,12 +222,13 @@ Supported `--market` values (data types):
 | `spot` | `spot` | Cash/spot market candles. |
 | `perp` | `perp` | Perpetual futures/swap candles. |
 | `oi` | `perp` | Open-interest time series for perpetual instruments. |
+| `funding` | `perp` | Funding-rate time series for perpetual instruments. |
 
 Exchange coverage:
 
-| Exchange | Spot | Perp | Notes |
-|---|---|---|---|
-| Deribit | Yes | Yes | Spot maps to instruments like `BTC_USDC`; perp maps to `BTC-PERPETUAL`. |
+| Exchange | Spot | Perp | OI | Funding | Notes |
+|---|---|---|---|---|---|
+| Deribit | Yes | Yes | Yes | Yes | Spot maps to instruments like `BTC_USDC`; perp maps to `BTC-PERPETUAL`. |
 
 ### 5.3 Perpetual Field Mapping (Deribit Origin -> Storage)
 
@@ -263,17 +301,17 @@ python3 main.py loader --exchange deribit --market spot --symbols BTC ETH --time
 Save loaded data to TimescaleDB:
 
 ```bash
-python3 main.py loader --exchange deribit --market spot perp oi --symbols BTC ETH --timeframe 1m --save-timescaledb --timescaledb-schema market_data
+python3 main.py loader --exchange deribit --market spot perp oi funding --symbols BTC ETH --timeframe 1m --save-timescaledb --timescaledb-schema market_data
 ```
 
 TimescaleDB bootstrap options:
 - Default behavior creates schema/tables/hypertables if missing.
 - Use `--timescaledb-no-bootstrap` to write into pre-existing schema objects only.
 
-Fetch OHLCV (spot+perp) and open interest in one run by including market `oi`:
+Fetch OHLCV (spot+perp), open interest, and funding in one run:
 
 ```bash
-python3 main.py loader --exchange deribit --market spot perp oi --symbols BTC ETH --timeframe 5m --save-parquet-lake --lake-root lake/bronze
+python3 main.py loader --exchange deribit --market spot perp oi funding --symbols BTC ETH --timeframe 5m --save-parquet-lake --lake-root lake/bronze
 ```
 
 Parquet lake write mode uses a stable file per partition (`data.parquet`) with staged merge+rewrite on each run to keep file counts bounded. Partition schema:
@@ -288,6 +326,14 @@ dataset_type=ohlcv/
     data.parquet
 
 dataset_type=open_interest/
+  exchange=<exchange>/
+  instrument_type=<perp>/
+  symbol=<symbol>/
+  timeframe=<interval>/
+  date=<YYYY-MM>/
+    data.parquet
+
+dataset_type=funding/
   exchange=<exchange>/
   instrument_type=<perp>/
   symbol=<symbol>/
@@ -385,11 +431,26 @@ Plot:
 Example:
 `samples/oi_perp_deribit_BTCUSDT_5m_sample_10_rows.png`
 
+### 7.4 Funding
+Description:
+Funding rows are stored under `dataset_type=funding` and sampled per run when `--market funding` is used.
+
+Plot:
+`samples/funding_<market>_<exchange>_<symbol>_<timeframe>_sample_10_rows.png` (full-history funding-rate time-series line chart for that group).
+
+Example:
+`samples/funding_perp_deribit_BTCUSDT_5m_sample_10_rows.png`
+
 ## 8. Testing Instructions
 
 ```bash
 make check
 ```
+
+Quality gate purpose:
+- `ruff check .`: fast static linting and import/style/error checks (for example unused imports, bad patterns, formatting-related lint rules).
+- `mypy .`: static type checking to catch type mismatches before runtime (`mupy` in notes/messages usually means `mypy`).
+- `pytest`: runtime test suite for behavioral correctness of ingestion, storage, CLI, and service flows.
 
 Equivalent direct commands:
 
@@ -430,11 +491,10 @@ Current coverage includes:
 
 ## 10. Known Limitations
 
-- Step 1 currently supports candles only (no funding or L2 yet).
+- L2 order book ingestion is not implemented yet.
 - No exchange failover yet.
 
 ## 11. Future Improvements
 
-- Add perpetual and funding endpoints.
 - Add Deribit adapter for L2 order book snapshots.
 - Add scheduled lake compaction and retention policies.

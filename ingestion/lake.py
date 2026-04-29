@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
+from ingestion.funding import FundingPoint
 from ingestion.open_interest import OpenInterestPoint
 from ingestion.spot import SpotCandle
 
@@ -112,6 +113,45 @@ def open_interest_record(
         "timeframe": item.interval,
         "open_interest": item.open_interest,
         "open_interest_value": item.open_interest_value,
+    }
+
+
+def funding_partition_key(item: FundingPoint, market: str) -> PartitionKey:
+    """Build partition key for funding records."""
+
+    return (
+        item.exchange,
+        market,
+        item.symbol,
+        item.interval,
+        item.open_time.strftime("%Y-%m"),
+    )
+
+
+def funding_record(
+    item: FundingPoint,
+    market: str,
+    run_id: str,
+    ingested_at: datetime,
+) -> dict[str, object]:
+    """Convert funding point to parquet-lake row format."""
+
+    return {
+        "schema_version": "v1",
+        "dataset_type": "funding",
+        "exchange": item.exchange,
+        "symbol": item.symbol,
+        "instrument_type": market,
+        "event_time": item.open_time,
+        "ingested_at": ingested_at,
+        "run_id": run_id,
+        "source_endpoint": "public_funding",
+        "open_time": item.open_time,
+        "close_time": item.close_time,
+        "timeframe": item.interval,
+        "funding_rate": item.funding_rate,
+        "index_price": item.index_price,
+        "mark_price": item.mark_price,
     }
 
 
@@ -305,6 +345,53 @@ def load_open_interest_from_lake(
     return [items_by_open_time[key] for key in sorted(items_by_open_time)]
 
 
+def load_funding_from_lake(
+    lake_root: str,
+    market: str,
+    exchange: str,
+    symbol: str,
+    timeframe: str,
+) -> list[FundingPoint]:
+    """Load all stored funding rows for one exchange/symbol/timeframe from parquet lake."""
+
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required for parquet lake output. Install project dependencies.") from exc
+
+    partition_root = (
+        Path(lake_root)
+        / "dataset_type=funding"
+        / f"exchange={exchange}"
+        / f"instrument_type={market}"
+        / f"symbol={symbol}"
+        / f"timeframe={timeframe}"
+    )
+    if not partition_root.exists():
+        return []
+
+    items_by_open_time: dict[datetime, FundingPoint] = {}
+    for data_file in sorted(partition_root.glob("date=*/data.parquet")):
+        parquet_file = pq.ParquetFile(data_file)  # type: ignore[no-untyped-call]
+        for batch in parquet_file.iter_batches(batch_size=10_000):  # type: ignore[no-untyped-call]
+            for row in batch.to_pylist():
+                open_time = row.get("open_time")
+                close_time = row.get("close_time")
+                if not isinstance(open_time, datetime) or not isinstance(close_time, datetime):
+                    continue
+                items_by_open_time[open_time] = FundingPoint(
+                    exchange=str(row.get("exchange", exchange)),
+                    symbol=str(row.get("symbol", symbol)),
+                    interval=str(row.get("timeframe", timeframe)),
+                    open_time=open_time,
+                    close_time=close_time,
+                    funding_rate=float(row.get("funding_rate", 0.0)),
+                    index_price=float(row.get("index_price", 0.0)),
+                    mark_price=float(row.get("mark_price", 0.0)),
+                )
+    return [items_by_open_time[key] for key in sorted(items_by_open_time)]
+
+
 def save_spot_candles_parquet_lake(
     candles_by_exchange: dict[str, dict[str, list[SpotCandle]]],
     market: str,
@@ -395,6 +482,58 @@ def save_open_interest_parquet_lake(
                 grouped[key].append(
                     open_interest_record(item=item, market=market, run_id=run_id, ingested_at=ingested_at)
                 )
+
+    def _write_one_partition(key: PartitionKey, rows: list[dict[str, object]]) -> str:
+        part_dir = partition_path(lake_root=lake_root, dataset_type=dataset_type, key=key)
+        part_dir.mkdir(parents=True, exist_ok=True)
+        file_path = part_dir / "data.parquet"
+        staging_path = part_dir / f".staging-{run_id}.parquet"
+
+        existing_rows: list[dict[str, object]] = []
+        if file_path.exists():
+            existing_table = pq.ParquetFile(file_path).read()  # type: ignore[no-untyped-call]
+            existing_rows = existing_table.to_pylist()
+
+        merged_rows = merge_and_deduplicate_rows(existing=existing_rows, new=rows)
+        table = pa.Table.from_pylist(merged_rows)
+        pq.write_table(table, staging_path)  # type: ignore[no-untyped-call]
+        staging_path.replace(file_path)
+        return str(file_path.resolve())
+
+    written_files: list[str] = []
+    if grouped:
+        max_workers = min(4, len(grouped))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_write_one_partition, key, rows) for key, rows in grouped.items()]
+            for future in concurrent.futures.as_completed(futures):
+                written_files.append(future.result())
+
+    return sorted(written_files)
+
+
+def save_funding_parquet_lake(
+    funding_by_exchange: dict[str, dict[str, list[FundingPoint]]],
+    market: str,
+    lake_root: str,
+) -> list[str]:
+    """Save fetched funding rows to parquet lake partitions."""
+
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required for parquet lake output. Install project dependencies.") from exc
+
+    run_id = utc_run_id()
+    ingested_at = datetime.now(UTC)
+    dataset_type = "funding"
+
+    grouped: defaultdict[PartitionKey, list[dict[str, object]]] = defaultdict(list)
+    for symbol_map in funding_by_exchange.values():
+        for items in symbol_map.values():
+            for item in items:
+                key = funding_partition_key(item=item, market=market)
+                grouped[key].append(funding_record(item=item, market=market, run_id=run_id, ingested_at=ingested_at))
 
     def _write_one_partition(key: PartitionKey, rows: list[dict[str, object]]) -> str:
         part_dir = partition_path(lake_root=lake_root, dataset_type=dataset_type, key=key)

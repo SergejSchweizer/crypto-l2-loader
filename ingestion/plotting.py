@@ -216,3 +216,55 @@ def save_open_interest_plot(
     figure.savefig(path, dpi=180)
     plt.close(figure)
     return str(path.resolve())
+
+
+def save_funding_plot(
+    exchange: str,
+    symbol: str,
+    interval: str,
+    times: list[datetime],
+    funding_values: list[float],
+    output_path: str,
+) -> str:
+    """Render and save one funding-rate line plot."""
+
+    if not times or not funding_values:
+        return output_path
+
+    try:
+        import matplotlib.dates as mdates
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required for plotting. Install project dependencies first.") from exc
+
+    figure, axis = plt.subplots(figsize=(12, 4))
+    figure.patch.set_facecolor("#f7f9fc")
+    axis.set_facecolor("#fdfefe")
+    axis.grid(alpha=0.2, linestyle="--", linewidth=0.8, color="#8aa0b5")
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.spines["left"].set_color("#8aa0b5")
+    axis.spines["bottom"].set_color("#8aa0b5")
+
+    axis.plot(times, funding_values, color="#7c3aed", linewidth=2.0)  # type: ignore[arg-type]
+    axis.fill_between(times, funding_values, min(funding_values), color="#a78bfa", alpha=0.12)  # type: ignore[arg-type]
+    axis.set_title(
+        f"{exchange.upper()}  {symbol}  ({interval})  Funding Rate",
+        fontsize=12,
+        fontweight="semibold",
+        color="#0f172a",
+        pad=10,
+    )
+    axis.set_ylabel("funding rate", color="#334155")
+    axis.yaxis.set_major_formatter(mticker.StrMethodFormatter("{x:,.6f}"))
+    axis.set_xlabel("time (UTC)", color="#334155")
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%m.%Y"))  # type: ignore[no-untyped-call]
+    figure.autofmt_xdate()
+    figure.tight_layout()
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+    return str(path.resolve())

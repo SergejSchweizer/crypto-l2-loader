@@ -19,6 +19,7 @@ import pandas as pd
 from application.dto import (
     ArtifactOptionsDTO,
     CandleFetchTaskDTO,
+    FundingFetchTaskDTO,
     LoaderStorageDTO,
     OpenInterestFetchTaskDTO,
     PersistOptionsDTO,
@@ -26,15 +27,25 @@ from application.dto import (
 from application.services.artifact_service import write_loader_samples_dto
 from application.services.fetch_service import (
     fetch_candle_tasks_parallel,
+    fetch_funding_tasks_parallel,
     fetch_open_interest_tasks_parallel,
     fetch_symbol_candles,
+    fetch_symbol_funding,
     fetch_symbol_open_interest,
 )
 from application.services.gapfill_service import _last_closed_open_ms, _missing_ranges_ms
 from application.services.storage_service import persist_loader_outputs_dto
 from infra.timescaledb import save_market_data_to_timescaledb, save_parquet_lake_to_timescaledb
+from ingestion.funding import (
+    FundingPoint,
+    fetch_funding_all_history,
+    fetch_funding_range,
+    funding_interval_to_milliseconds,
+    normalize_funding_timeframe,
+)
 from ingestion.lake import (
     load_combined_dataframe_from_lake,
+    load_funding_from_lake,
     load_open_interest_from_lake,
     load_spot_candles_from_lake,
     open_times_in_lake,
@@ -62,7 +73,7 @@ from ingestion.spot import (
 LOGGER_NAME = "crypto_l2_loader"
 DEFAULT_LOG_DIR = "/volume1/Temp/logs"
 DEFAULT_FETCH_CONCURRENCY = 8
-DataType = Literal["spot", "perp", "oi"]
+DataType = Literal["spot", "perp", "oi", "funding"]
 
 
 class SingleInstanceError(RuntimeError):
@@ -198,6 +209,32 @@ def _fetch_symbol_open_interest(
     )
 
 
+def _fetch_symbol_funding(
+    exchange: Exchange,
+    market: Market,
+    symbol: str,
+    timeframe: str,
+    lake_root: str,
+) -> list[FundingPoint]:
+    """Fetch funding data for one symbol (perp only)."""
+
+    return fetch_symbol_funding(
+        exchange=exchange,
+        market=market,
+        symbol=symbol,
+        timeframe=timeframe,
+        lake_root=lake_root,
+        open_times_reader=open_times_in_lake_by_dataset,
+        timeframe_normalizer=normalize_funding_timeframe,
+        symbol_normalizer=normalize_storage_symbol,
+        interval_ms_resolver=funding_interval_to_milliseconds,
+        now_open_resolver=_last_closed_open_ms,
+        ranges_builder=_missing_ranges_ms,
+        history_fetcher=fetch_funding_all_history,
+        range_fetcher=fetch_funding_range,
+    )
+
+
 def _fetch_concurrency() -> int:
     """Return bounded fetch concurrency from environment."""
 
@@ -259,16 +296,46 @@ async def _fetch_open_interest_tasks_parallel(
     return result.rows, result.errors
 
 
+async def _fetch_funding_tasks_parallel(
+    funding_tasks: list[tuple[Exchange, str, str]],
+    lake_root: str,
+    concurrency: int,
+    logger: logging.Logger,
+) -> tuple[
+    dict[tuple[Exchange, str, str], list[FundingPoint]],
+    dict[tuple[Exchange, str, str], str],
+]:
+    """Fetch funding tasks concurrently with bounded parallelism."""
+
+    service_tasks = [
+        FundingFetchTaskDTO(exchange=exchange, symbol=symbol, timeframe=timeframe)
+        for exchange, symbol, timeframe in funding_tasks
+    ]
+    result = await fetch_funding_tasks_parallel(
+        tasks=service_tasks,
+        lake_root=lake_root,
+        concurrency=concurrency,
+        logger=logger,
+        symbol_fetcher=_fetch_symbol_funding,
+    )
+    return result.rows, result.errors
+
+
 def _write_loader_samples(
     candles_for_storage: dict[Market, dict[str, dict[str, list[SpotCandle]]]],
     open_interest_for_storage: dict[Market, dict[str, dict[str, list[OpenInterestPoint]]]],
     logger: logging.Logger,
+    funding_for_storage: dict[Market, dict[str, dict[str, list[FundingPoint]]]] | None = None,
     generate_plots: bool = True,
 ) -> None:
     """Write per exchange/symbol/timeframe samples and matching full-data plots."""
 
     write_loader_samples_dto(
-        storage=LoaderStorageDTO(candles=candles_for_storage, open_interest=open_interest_for_storage),
+        storage=LoaderStorageDTO(
+            candles=candles_for_storage,
+            open_interest=open_interest_for_storage,
+            funding=funding_for_storage or {},
+        ),
         logger=logger,
         options=ArtifactOptionsDTO(generate_plots=generate_plots),
     )
@@ -291,9 +358,9 @@ def build_parser() -> argparse.ArgumentParser:
     spot_parser.add_argument(
         "--market",
         nargs="+",
-        choices=["spot", "perp", "oi"],
+        choices=["spot", "perp", "oi", "funding"],
         default=["spot"],
-        help="One or more data types to fetch, e.g. --market spot perp oi",
+        help="One or more data types to fetch, e.g. --market spot perp oi funding",
     )
     spot_parser.add_argument(
         "--symbols",
@@ -421,14 +488,17 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
             data_types = cast(list[DataType], args.market)
             ohlcv_markets = [item for item in data_types if item in {"spot", "perp"}]
             oi_requested = "oi" in data_types
+            funding_requested = "funding" in data_types
             multi_market = len(data_types) > 1
             requested_timeframes = cast(list[str], args.timeframes if args.timeframes else [args.timeframe])
             multi_timeframe = len(requested_timeframes) > 1
             output: dict[str, object] = {}
             candles_for_storage: dict[Market, dict[str, dict[str, list[SpotCandle]]]] = {}
             open_interest_for_storage: dict[Market, dict[str, dict[str, list[OpenInterestPoint]]]] = {}
+            funding_for_storage: dict[Market, dict[str, dict[str, list[FundingPoint]]]] = {}
             tasks: list[tuple[Exchange, Market, str, str]] = []
             oi_tasks: list[tuple[Exchange, str, str]] = []
+            funding_tasks: list[tuple[Exchange, str, str]] = []
 
             for exchange in exchanges:
                 exchange_output: dict[str, object] = {}
@@ -454,6 +524,10 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
                     for timeframe in normalized_timeframes:
                         for symbol in args.symbols:
                             oi_tasks.append((exchange, symbol, timeframe))
+                if funding_requested:
+                    for timeframe in normalized_timeframes:
+                        for symbol in args.symbols:
+                            funding_tasks.append((exchange, symbol, timeframe))
 
             fetch_concurrency = _fetch_concurrency()
             logger.info(
@@ -474,6 +548,17 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
                 oi_results, oi_errors = asyncio.run(
                     _fetch_open_interest_tasks_parallel(
                         oi_tasks=oi_tasks,
+                        lake_root=args.lake_root,
+                        concurrency=fetch_concurrency,
+                        logger=logger,
+                    )
+                )
+            funding_results: dict[tuple[Exchange, str, str], list[FundingPoint]] = {}
+            funding_errors: dict[tuple[Exchange, str, str], str] = {}
+            if funding_tasks:
+                funding_results, funding_errors = asyncio.run(
+                    _fetch_funding_tasks_parallel(
+                        funding_tasks=funding_tasks,
                         lake_root=args.lake_root,
                         concurrency=fetch_concurrency,
                         logger=logger,
@@ -546,12 +631,51 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
                         oi_plot_key = symbol_key
                     oi_exchange_rows[oi_plot_key] = oi_rows
 
+            if funding_requested:
+                for exchange, symbol, timeframe in funding_tasks:
+                    symbol_key = symbol.upper()
+                    funding_key = (exchange, symbol, timeframe)
+                    exchange_output = cast(dict[str, object], output[exchange])
+                    if multi_market:
+                        market_bucket = cast(dict[str, object], exchange_output.setdefault("funding", {}))
+                    else:
+                        market_bucket = exchange_output
+                    if multi_timeframe:
+                        timeframe_bucket = cast(dict[str, object], market_bucket.setdefault(timeframe, {}))
+                    else:
+                        timeframe_bucket = market_bucket
+                    if funding_key in funding_errors:
+                        timeframe_bucket[symbol_key] = {"error": funding_errors[funding_key]}
+                        continue
+                    funding_rows = funding_results.get(funding_key, [])
+                    timeframe_bucket[symbol_key] = [
+                        {
+                            "exchange": item.exchange,
+                            "symbol": item.symbol,
+                            "interval": item.interval,
+                            "open_time": item.open_time.isoformat(),
+                            "close_time": item.close_time.isoformat(),
+                            "funding_rate": item.funding_rate,
+                            "index_price": item.index_price,
+                            "mark_price": item.mark_price,
+                        }
+                        for item in funding_rows
+                    ]
+                    funding_by_market = funding_for_storage.setdefault("perp", {})
+                    funding_exchange_rows = funding_by_market.setdefault(exchange, {})
+                    if multi_timeframe:
+                        funding_plot_key = f"{symbol_key}__{timeframe}"
+                    else:
+                        funding_plot_key = symbol_key
+                    funding_exchange_rows[funding_plot_key] = funding_rows
+
             if args.save_parquet_lake:
                 try:
                     storage_result = persist_loader_outputs_dto(
                         storage=LoaderStorageDTO(
                             candles=candles_for_storage,
                             open_interest=open_interest_for_storage,
+                            funding=funding_for_storage,
                         ),
                         options=PersistOptionsDTO(
                             save_parquet_lake=True,
@@ -560,6 +684,7 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
                             timescaledb_schema=cast(str, args.timescaledb_schema),
                             create_schema=not bool(args.timescaledb_no_bootstrap),
                             oi_requested=oi_requested,
+                            funding_requested=funding_requested,
                         ),
                         save_tsdb_fn=save_market_data_to_timescaledb,
                     )
@@ -574,6 +699,7 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
                         storage=LoaderStorageDTO(
                             candles=candles_for_storage,
                             open_interest=open_interest_for_storage,
+                            funding=funding_for_storage,
                         ),
                         options=PersistOptionsDTO(
                             save_parquet_lake=False,
@@ -582,6 +708,7 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
                             timescaledb_schema=cast(str, args.timescaledb_schema),
                             create_schema=not bool(args.timescaledb_no_bootstrap),
                             oi_requested=oi_requested,
+                            funding_requested=funding_requested,
                         ),
                         save_tsdb_fn=save_market_data_to_timescaledb,
                     )
@@ -592,6 +719,7 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
 
             artifact_candles: dict[Market, dict[str, dict[str, list[SpotCandle]]]] = {}
             artifact_oi: dict[Market, dict[str, dict[str, list[OpenInterestPoint]]]] = {}
+            artifact_funding: dict[Market, dict[str, dict[str, list[FundingPoint]]]] = {}
             for exchange, market, symbol, timeframe in tasks:
                 symbol_key = symbol.upper()
                 if multi_market and multi_timeframe:
@@ -686,10 +814,58 @@ def _run_loader(args: argparse.Namespace, logger: logging.Logger) -> None:
                     merged_oi = [merged_oi_by_open_time[key] for key in sorted(merged_oi_by_open_time)]
                     artifact_oi.setdefault("perp", {}).setdefault(exchange, {})[oi_plot_key] = merged_oi
 
+            if funding_requested:
+                for exchange, symbol, timeframe in funding_tasks:
+                    symbol_key = symbol.upper()
+                    funding_key = (exchange, symbol, timeframe)
+                    if multi_timeframe:
+                        funding_plot_key = f"{symbol_key}__{timeframe}"
+                    else:
+                        funding_plot_key = symbol_key
+                    fetched_funding = funding_results.get(funding_key, [])
+                    merged_funding_by_open_time: dict[datetime, FundingPoint] = {
+                        item.open_time: item for item in fetched_funding
+                    }
+                    try:
+                        storage_symbol = normalize_storage_symbol(
+                            exchange=exchange,
+                            symbol=symbol,
+                            market="perp",
+                        )
+                        normalized_funding_timeframe = normalize_funding_timeframe(exchange=exchange, value=timeframe)
+                        stored_funding_times = open_times_in_lake_by_dataset(
+                            lake_root=args.lake_root,
+                            dataset_type="funding",
+                            market="perp",
+                            exchange=exchange,
+                            symbol=storage_symbol,
+                            timeframe=normalized_funding_timeframe,
+                        )
+                        if stored_funding_times:
+                            lake_funding = load_funding_from_lake(
+                                lake_root=args.lake_root,
+                                market="perp",
+                                exchange=exchange,
+                                symbol=storage_symbol,
+                                timeframe=normalized_funding_timeframe,
+                            )
+                            for item in lake_funding:
+                                merged_funding_by_open_time[item.open_time] = item
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "Failed to load full-history funding source exchange=%s symbol=%s timeframe=%s",
+                            exchange,
+                            symbol,
+                            timeframe,
+                        )
+                    merged_funding = [merged_funding_by_open_time[key] for key in sorted(merged_funding_by_open_time)]
+                    artifact_funding.setdefault("perp", {}).setdefault(exchange, {})[funding_plot_key] = merged_funding
+
             try:
                 _write_loader_samples(
                     candles_for_storage=artifact_candles,
                     open_interest_for_storage=artifact_oi,
+                    funding_for_storage=artifact_funding,
                     logger=logger,
                     generate_plots=bool(args.plot),
                 )

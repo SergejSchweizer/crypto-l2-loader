@@ -1,4 +1,4 @@
-"""TimescaleDB sink for OHLCV and open-interest data."""
+"""TimescaleDB sink for OHLCV, open-interest, and funding data."""
 
 from __future__ import annotations
 
@@ -9,12 +9,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ingestion.lake import candle_record, open_interest_record
+from ingestion.funding import FundingPoint
+from ingestion.lake import candle_record, funding_record, open_interest_record
 from ingestion.open_interest import OpenInterestPoint
 from ingestion.spot import Market, SpotCandle
 
 OhlcvTableName = "ohlcv"
 OpenInterestTableName = "open_interest"
+FundingTableName = "funding"
 _SQL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_PARQUET_BATCH_SIZE = 10_000
 DEFAULT_DB_WRITE_BATCH_SIZE = 5_000
@@ -152,6 +154,28 @@ def _build_open_interest_db_row(row: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _build_funding_db_row(row: dict[str, object]) -> dict[str, object]:
+    """Map one parquet funding row into DB upsert payload format."""
+
+    return {
+        "exchange": row.get("exchange"),
+        "symbol": row.get("symbol"),
+        "instrument_type": row.get("instrument_type"),
+        "timeframe": row.get("timeframe"),
+        "open_time": row.get("open_time"),
+        "close_time": row.get("close_time"),
+        "funding_rate": row.get("funding_rate"),
+        "index_price": row.get("index_price", 0.0),
+        "mark_price": row.get("mark_price", 0.0),
+        "schema_version": row.get("schema_version", "v1"),
+        "dataset_type": row.get("dataset_type", "funding"),
+        "event_time": row.get("event_time", row.get("open_time")),
+        "ingested_at": row.get("ingested_at"),
+        "run_id": row.get("run_id", "unknown"),
+        "source_endpoint": row.get("source_endpoint", "unknown"),
+    }
+
+
 def _upsert_rows_in_batches(
     row_iter: Iterator[dict[str, object]],
     write_batch_size: int,
@@ -260,6 +284,43 @@ def _create_schema_and_tables(conn: Any, schema: str) -> None:
             ON {safe_schema}.{OpenInterestTableName} (exchange, symbol, timeframe, open_time DESC);
             """
         )
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {safe_schema}.{FundingTableName} (
+                exchange TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                instrument_type TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                open_time TIMESTAMPTZ NOT NULL,
+                close_time TIMESTAMPTZ NOT NULL,
+                funding_rate DOUBLE PRECISION NOT NULL,
+                index_price DOUBLE PRECISION NOT NULL,
+                mark_price DOUBLE PRECISION NOT NULL,
+                schema_version TEXT NOT NULL,
+                dataset_type TEXT NOT NULL,
+                event_time TIMESTAMPTZ NOT NULL,
+                ingested_at TIMESTAMPTZ NOT NULL,
+                run_id TEXT NOT NULL,
+                source_endpoint TEXT NOT NULL,
+                PRIMARY KEY (exchange, instrument_type, symbol, timeframe, open_time)
+            );
+            """
+        )
+        cur.execute(
+            f"""
+            SELECT create_hypertable(
+                '{safe_schema}.{FundingTableName}',
+                'open_time',
+                if_not_exists => TRUE
+            );
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_{FundingTableName}_symbol_time
+            ON {safe_schema}.{FundingTableName} (exchange, symbol, timeframe, open_time DESC);
+            """
+        )
 
 
 def _upsert_ohlcv(conn: Any, schema: str, rows: list[dict[str, object]]) -> int:
@@ -344,9 +405,45 @@ def _upsert_open_interest(conn: Any, schema: str, rows: list[dict[str, object]])
     return len(rows)
 
 
+def _upsert_funding(conn: Any, schema: str, rows: list[dict[str, object]]) -> int:
+    """Upsert funding rows into TimescaleDB."""
+
+    if not rows:
+        return 0
+
+    safe_schema = _validate_sql_identifier(value=schema, kind="schema")
+    sql = f"""
+        INSERT INTO {safe_schema}.{FundingTableName} (
+            exchange, symbol, instrument_type, timeframe, open_time, close_time,
+            funding_rate, index_price, mark_price,
+            schema_version, dataset_type, event_time, ingested_at, run_id, source_endpoint
+        ) VALUES (
+            %(exchange)s, %(symbol)s, %(instrument_type)s, %(timeframe)s, %(open_time)s, %(close_time)s,
+            %(funding_rate)s, %(index_price)s, %(mark_price)s,
+            %(schema_version)s, %(dataset_type)s, %(event_time)s, %(ingested_at)s, %(run_id)s, %(source_endpoint)s
+        )
+        ON CONFLICT (exchange, instrument_type, symbol, timeframe, open_time)
+        DO UPDATE SET
+            close_time = EXCLUDED.close_time,
+            funding_rate = EXCLUDED.funding_rate,
+            index_price = EXCLUDED.index_price,
+            mark_price = EXCLUDED.mark_price,
+            schema_version = EXCLUDED.schema_version,
+            dataset_type = EXCLUDED.dataset_type,
+            event_time = EXCLUDED.event_time,
+            ingested_at = EXCLUDED.ingested_at,
+            run_id = EXCLUDED.run_id,
+            source_endpoint = EXCLUDED.source_endpoint;
+    """
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
+    return len(rows)
+
+
 def save_market_data_to_timescaledb(
     candles_for_storage: dict[Market, dict[str, dict[str, list[SpotCandle]]]],
     open_interest_for_storage: dict[Market, dict[str, dict[str, list[OpenInterestPoint]]]],
+    funding_for_storage: dict[Market, dict[str, dict[str, list[FundingPoint]]]] | None = None,
     schema: str = "market_data",
     create_schema: bool = True,
 ) -> dict[str, int | str]:
@@ -383,6 +480,17 @@ def save_market_data_to_timescaledb(
                     ]
                 )
 
+    funding_rows: list[dict[str, object]] = []
+    for market, funding_by_exchange in (funding_for_storage or {}).items():
+        for funding_by_symbol in funding_by_exchange.values():
+            for funding_items in funding_by_symbol.values():
+                funding_rows.extend(
+                    [
+                        funding_record(item=item, market=market, run_id=run_id, ingested_at=ingested_at)
+                        for item in funding_items
+                    ]
+                )
+
     settings = _db_settings()
     with psycopg.connect(**settings) as conn:
         with conn.transaction():
@@ -390,11 +498,13 @@ def save_market_data_to_timescaledb(
                 _create_schema_and_tables(conn=conn, schema=safe_schema)
             ohlcv_count = _upsert_ohlcv(conn=conn, schema=safe_schema, rows=ohlcv_rows)
             oi_count = _upsert_open_interest(conn=conn, schema=safe_schema, rows=oi_rows)
+            funding_count = _upsert_funding(conn=conn, schema=safe_schema, rows=funding_rows)
 
     return {
         "schema": safe_schema,
         "ohlcv_rows": ohlcv_count,
         "open_interest_rows": oi_count,
+        "funding_rows": funding_count,
     }
 
 
@@ -461,6 +571,15 @@ def save_parquet_lake_to_timescaledb(
             batch_size=parquet_batch_size,
         )
     )
+    funding_rows = (
+        _build_funding_db_row(row)
+        for row in _iter_parquet_rows(
+            lake_root=lake_root,
+            glob_pattern="dataset_type=funding/exchange=*/instrument_type=*/symbol=*/timeframe=*/date=*/data.parquet",
+            allow_partition=_allow,
+            batch_size=parquet_batch_size,
+        )
+    )
 
     settings = _db_settings()
     with psycopg.connect(**settings) as conn:
@@ -481,9 +600,17 @@ def save_parquet_lake_to_timescaledb(
                 conn=conn,
                 schema=safe_schema,
             )
+            funding_count = _upsert_rows_in_batches(
+                row_iter=funding_rows,
+                write_batch_size=write_batch_size,
+                upsert_fn=_upsert_funding,
+                conn=conn,
+                schema=safe_schema,
+            )
 
     return {
         "schema": safe_schema,
         "ohlcv_rows": ohlcv_count,
         "open_interest_rows": oi_count,
+        "funding_rows": funding_count,
     }
