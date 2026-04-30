@@ -1,9 +1,9 @@
-# Deribit OHLCV Ingestion Baseline for Crypto Research Pipelines
+# Deribit Market Data Ingestion Baseline for Crypto Research Pipelines
 
 ## Abstract
-This report presents a production-oriented baseline for cryptocurrency candle ingestion designed to support downstream quantitative research. The problem addressed is the lack of reproducible, maintainable ingestion layers in early-stage quant projects, where exchange-specific scripts and schema drift frequently undermine empirical validity. We implement a typed, modular ingestion pipeline with adapter abstractions for Deribit, a command-line interface for deterministic execution (including multi-market runs such as `--market spot perp`), and partitioned parquet-lake storage. Data are sourced from public exchange REST endpoints and normalized into a canonical OHLCV schema with metadata fields for run traceability. The main finding is engineering-focused: the system provides deterministic normalization, supports backward pagination and gap-fill synchronization, and preserves idempotent persistence via natural-key partition merges. The contribution is a maintainable ingestion foundation suitable for subsequent market microstructure, regime, and forecasting studies, with explicit reproducibility controls (strict typing, tests, linting, and stable execution commands).
+This report presents a production-oriented baseline for cryptocurrency market-data ingestion designed to support downstream quantitative research. The problem addressed is the lack of reproducible, maintainable ingestion layers in early-stage quant projects, where exchange-specific scripts and schema drift frequently undermine empirical validity. We implement a typed, modular ingestion pipeline with adapter abstractions for Deribit, command-line interfaces for deterministic execution, and partitioned parquet-lake storage. Data are sourced from public exchange REST endpoints and normalized into canonical OHLCV, open-interest, funding, and L2 M1 microstructure feature schemas with metadata fields for run traceability. The main finding is engineering-focused: the system provides deterministic normalization, supports backward pagination and gap-fill synchronization for historical series, runs bounded async multi-symbol L2 polling for BTC/ETH perpetual order book snapshots, and preserves idempotent persistence via natural-key partition merges. The contribution is a maintainable ingestion foundation suitable for subsequent market microstructure, regime, and forecasting studies, with explicit reproducibility controls (strict typing, tests, linting, config-driven runs, and stable execution commands).
 
-Canonical data-type naming in this project is fixed as `spot`, `perp`, and `oi` across CLI, code, and documentation (with parquet storage label `dataset_type=open_interest` representing `oi`).
+Canonical data-type naming in this project is fixed as `spot`, `perp`, `oi`, and `funding` across CLI, code, and documentation (with parquet storage label `dataset_type=open_interest` representing `oi`). L2 feature bars are stored separately as `dataset_type=l2_m1`.
 
 ## Introduction
 Reliable market-data ingestion is a prerequisite for valid quantitative inference in crypto research.
@@ -12,8 +12,7 @@ Many practical pipelines fail due to exchange-specific one-off scripts, inconsis
 
 This project proposes a modular ingestion architecture with typed interfaces, explicit normalization, and reproducible command-line workflows focused on Deribit as the current production exchange.
 
-The contributions of this stage are: (1) Deribit OHLCV normalization, (2) parquet-lake persistence paths, and (3) tested operational workflows for repeatable data acquisition.
-The repository now also includes Deribit perpetual L2 snapshot ingestion aggregated into M1 microstructure feature bars for downstream model development.
+The contributions of this stage are: (1) Deribit OHLCV, open-interest, and funding normalization, (2) parquet-lake persistence paths, (3) tested operational workflows for repeatable data acquisition, and (4) Deribit perpetual L2 snapshot ingestion aggregated into M1 microstructure feature bars for downstream model development.
 
 ## Literature Review
 Volatility clustering and regime dependence motivate robust historical market-data pipelines. ARCH/GARCH foundations establish heteroskedastic behavior in financial time series, requiring high-integrity timestamped observations (Engle, 1982; Bollerslev, 1986). Regime-switching frameworks further highlight sensitivity to data quality and temporal consistency (Hamilton, 1989). Later work on high-frequency econometrics and realized-volatility estimation reinforces the need for reliable, granular data ingestion and synchronization processes (Andersen et al., 2001; Barndorff-Nielsen and Shephard, 2002).
@@ -22,11 +21,11 @@ Market microstructure and stylized-facts literature also emphasizes heavy tails,
 Within crypto-specific empirical work, market microstructure studies and liquidity fragmentation analyses depend on exchange-consistent symbol and timeframe normalization. This baseline does not yet estimate econometric models, but it is intentionally built to satisfy upstream data-quality assumptions for such methods.
 
 ## Dataset
-- Source: Deribit `/api/v2/public/get_tradingview_chart_data` and Deribit `/api/v2/public/get_last_settlements_by_instrument`.
+- Source: Deribit `/api/v2/public/get_tradingview_chart_data`, `/api/v2/public/get_last_settlements_by_instrument`, `/api/v2/public/get_funding_rate_history`, and `/api/v2/public/get_order_book`.
 - Sample period: user-configurable runtime period determined by symbols, markets, timeframes, and existing parquet coverage.
 - Number of observations: runtime-dependent on symbol/timeframe scope and auto bootstrap vs gap-fill behavior.
 - Variables: `open_time`, `close_time`, `open`, `high`, `low`, `close`, `volume`, `quote_volume`, `trade_count` plus provenance metadata.
-- Additional perp feature set: `open_interest`, `open_interest_value` where available.
+- Additional perp feature set: `open_interest`, `open_interest_value`, funding-rate fields, and L2 M1 microstructure fields including mid-price OHLC, spread, depth, imbalance, VWAP, microprice, open-interest, and funding snapshots.
 - Cleaning methodology: exchange adapter normalization, timeframe validation, symbol normalization, UTC conversion, partition-level deduplication by natural key.
 - Train/test split: not applicable at ingestion-only stage.
 
@@ -82,6 +81,16 @@ Within crypto-specific empirical work, market microstructure studies and liquidi
 - Exchange-specific mapping:
   - Deribit: settlement `timestamp` is bucketed to the requested timeframe prior to interval construction; `open_interest <- position`, `open_interest_value <- 0.0`.
 
+#### `l2_m1` (perpetual order book features)
+- Constructed fields:
+  `minute_ts`, `snapshot_count`, `mid_open`, `mid_high`, `mid_low`, `mid_close`, `spread_bps_mean`, `spread_bps_max`, `spread_bps_last`, depth aggregates, imbalance aggregates, VWAP, microprice, open-interest, funding snapshot fields, and fetch-duration aggregates.
+- Field construction logic:
+  - Deribit order book snapshots are normalized into `L2Snapshot` records with UTC timestamps, bids, asks, mark price, index price, open interest, and funding fields.
+  - Each polling tick fetches all configured symbols concurrently under `L2_FETCH_CONCURRENCY`.
+  - Valid non-crossed snapshots are grouped by exchange, symbol, and UTC minute.
+  - M1 bars use unweighted means for spread, depth, imbalance, VWAP, microprice displacement, and fetch duration; open/close/high/low fields are computed from per-snapshot mid prices.
+  - `L2_INGEST_MAX_RUNTIME_S` bounds collection time for scheduled runs; partial results are retained and logged rather than overlapping a subsequent cron invocation.
+
 ## Methodology
 ### System Design
 ```text
@@ -93,7 +102,9 @@ CLI -> Application Service Layer (gapfill_service, fetch_service)
 L2 extension path:
 
 ```text
-CLI (loader-l2-m1) -> Deribit L2 Adapter -> L2Snapshot -> M1 feature aggregation -> Parquet Lake
+CLI (loader-l2-m1) -> L2FetchConfig -> Async Polling Ticks
+    -> Deribit L2 Adapter -> L2Snapshot -> M1 Feature Aggregation
+    -> Parquet Lake
 ```
 
 Storage and artifact side effects are also routed through dedicated services (`storage_service`, `artifact_service`) to keep CLI logic thin and testable. Canonical CLI-to-storage naming (`spot`/`perp`/`oi` -> `dataset_type` + `instrument_type`) is formalized in `application/schema.py`.
@@ -128,6 +139,8 @@ Upsert policy enforces idempotency:
 - Pagination for exchange request limits.
 - Gap-fill computes missing intervals from stored open-time sets.
 - Fetch execution is parallelized with bounded concurrency controls.
+- L2 snapshot execution uses bounded async per-tick symbol polling, so BTC/ETH perpetual order books are requested concurrently before the configured inter-tick sleep.
+- L2 scheduled execution is config-driven through local `.env` variables such as `L2_INGEST_SNAPSHOT_COUNT`, `L2_INGEST_POLL_INTERVAL_S`, `L2_INGEST_MAX_RUNTIME_S`, and `L2_FETCH_CONCURRENCY`.
 - Fetch orchestration and task error isolation are handled in a dedicated service layer (`application/services/fetch_service.py`) rather than directly in CLI command code.
 - Parquet reads/writes process data in batches to bound memory usage.
 - Timescale ingestion from parquet uses streaming row iteration with bounded DB upsert batches.
@@ -170,6 +183,7 @@ No predictive or regime models are trained in this stage.
 | Chunked Timescale ingest | Streaming parquet read + bounded DB upsert batches | Passed with stable memory profile |
 | Open-interest integration | Deribit perp dataset_type=open_interest | Passed for all-history and gap-fill paths |
 | L2 M1 aggregation | Deribit perp orderbook snapshots -> M1 feature bars | Passed via aggregation and parquet tests (`tests/test_l2.py`, `tests/test_l2_adapter.py`, `tests/test_lake.py`) |
+| Async L2 polling | Same-tick BTC/ETH perp snapshot fetches | Passed via concurrent scheduling test (`tests/test_l2.py`) |
 
 ### Figures
 Figure 1. OHLCV Spot series (Deribit BTCUSDT 1m).
@@ -205,17 +219,18 @@ Interpretation: Figure 5 tracks contract participation dynamics and complements 
 ## Discussion
 Business implications: a reliable ingestion substrate lowers operational risk for strategy research and accelerates feature engineering, backtesting, and monitoring deployment.
 
-Limitations: current scope includes OHLCV, open-interest, and funding for Deribit, but not L2 order book or trade-level feeds. Exchange-specific outages and schema changes still require active maintenance.
+Limitations: current scope includes OHLCV, open-interest, funding, and finite REST L2 order book snapshots for Deribit, but not continuous websocket depth reconstruction or trade-level feeds. Exchange-specific outages and schema changes still require active maintenance.
 
 Model weaknesses/assumptions: this stage does not perform inference; assumptions are engineering assumptions (timestamp consistency, endpoint availability, and exchange-provided data correctness).
 
 ## Conclusion
-This baseline establishes a reproducible and extensible ingestion pipeline for Deribit crypto OHLCV data with typed normalization and idempotent persistence. The immediate value is production-quality data plumbing for future empirical studies. Next steps are fixed experiment configs, notebook-to-report metrics automation, and model/evaluation modules with formal benchmarks.
+This baseline establishes a reproducible and extensible ingestion pipeline for Deribit crypto market data with typed normalization, bounded async L2 polling, and idempotent persistence. The immediate value is production-quality data plumbing for future empirical studies. Next steps are fixed experiment configs, notebook-to-report metrics automation, continuous websocket L2 ingestion, and model/evaluation modules with formal benchmarks.
 
 ## Appendix
 ### Reproducibility Controls
 - Static checks: `ruff`, `mypy` (strict), `pytest`.
 - Deterministic interfaces: typed adapters and normalized candle schema.
+- Config-driven scheduled L2 runs via local `.env` values, including bounded runtime and concurrency controls.
 - Incremental persistence: partition-level merge and key-based dedup in parquet files.
 
 ## References

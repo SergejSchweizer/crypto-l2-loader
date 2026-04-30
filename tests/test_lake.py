@@ -242,6 +242,9 @@ def test_save_l2_m1_parquet_lake_rewrites_single_partition_file(tmp_path: Path) 
         open_interest_last=1000.0,
         funding_8h_last=0.0001,
         current_funding_last=0.00001,
+        fetch_duration_s_mean=0.11,
+        fetch_duration_s_max=0.22,
+        fetch_duration_s_last=0.12,
     )
     row_2 = L2MinuteBar(
         minute_ts=datetime(2026, 4, 29, 10, 1, tzinfo=UTC),
@@ -275,6 +278,9 @@ def test_save_l2_m1_parquet_lake_rewrites_single_partition_file(tmp_path: Path) 
         open_interest_last=1002.0,
         funding_8h_last=0.0001,
         current_funding_last=0.00001,
+        fetch_duration_s_mean=0.13,
+        fetch_duration_s_max=0.24,
+        fetch_duration_s_last=0.14,
     )
 
     first = {"deribit": {"BTC-PERPETUAL": [row_1]}}

@@ -13,6 +13,82 @@ DEFAULT_LOG_DIR = "/volume1/Temp/logs"
 DEFAULT_FETCH_CONCURRENCY = 8
 
 
+def load_env_file(path: str = ".env") -> None:
+    """Load simple KEY=VALUE pairs from a local environment file."""
+
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = _strip_env_quotes(value.strip())
+
+
+def _strip_env_quotes(value: str) -> str:
+    """Remove matching single or double quotes from an env value."""
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment variable with fallback."""
+
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_float(name: str, default: float) -> float:
+    """Read a float environment variable with fallback."""
+
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def env_int(name: str, default: int) -> int:
+    """Read an integer environment variable with fallback."""
+
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def env_list(name: str, default: list[str]) -> list[str]:
+    """Read a whitespace or comma-delimited string list from the environment."""
+
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.replace(",", " ")
+    values = [item.strip() for item in normalized.split() if item.strip()]
+    return values or default
+
+
+def env_str(name: str, default: str) -> str:
+    """Read a string environment variable with fallback."""
+
+    return os.getenv(name, default)
+
+
 class SingleInstanceError(RuntimeError):
     """Raised when another CLI instance is already running."""
 
@@ -45,10 +121,18 @@ class SingleInstanceLock:
         self._fd = None
 
 
-def configure_logging() -> logging.Logger:
-    """Configure file logging with weekly rotation."""
+def _safe_log_module_name(module_name: str) -> str:
+    """Return a filesystem-safe log module name."""
 
-    logger = logging.getLogger(LOGGER_NAME)
+    normalized = module_name.strip().replace("/", "-").replace("\\", "-")
+    return normalized or "crypto-l2-loader"
+
+
+def configure_logging(module_name: str = "crypto-l2-loader") -> logging.Logger:
+    """Configure module-specific file logging with weekly rotation."""
+
+    safe_module_name = _safe_log_module_name(module_name)
+    logger = logging.getLogger(f"{LOGGER_NAME}.{safe_module_name}")
     if logger.handlers:
         return logger
 
@@ -59,7 +143,7 @@ def configure_logging() -> logging.Logger:
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = TimedRotatingFileHandler(
-            filename=log_dir / "crypto-l2-loader.log",
+            filename=log_dir / f"{safe_module_name}.log",
             when="D",
             interval=7,
             backupCount=0,

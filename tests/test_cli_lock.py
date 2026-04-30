@@ -19,6 +19,13 @@ from ingestion.open_interest import OpenInterestPoint
 from ingestion.spot import SpotCandle
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cli_test_logs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep CLI tests from writing to the configured runtime log directory."""
+
+    monkeypatch.setenv("L2_SYNC_LOG_DIR", str(tmp_path / "logs"))
+
+
 def test_single_instance_lock_creates_lock_file(tmp_path: Path) -> None:
     lock_file = tmp_path / "test.lock"
 
@@ -151,6 +158,28 @@ def test_main_loader_command_still_uses_single_instance_lock(
 
     with pytest.raises(SystemExit, match="loader already running"):
         cli.main()
+
+
+def test_l2_parser_defaults_can_come_from_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("L2_INGEST_SYMBOLS", "BTC,ETH")
+    monkeypatch.setenv("L2_INGEST_LEVELS", "25")
+    monkeypatch.setenv("L2_INGEST_SNAPSHOT_COUNT", "5")
+    monkeypatch.setenv("L2_INGEST_POLL_INTERVAL_S", "10")
+    monkeypatch.setenv("L2_INGEST_MAX_RUNTIME_S", "55")
+    monkeypatch.setenv("L2_INGEST_SAVE_PARQUET_LAKE", "true")
+    monkeypatch.setenv("L2_INGEST_LAKE_ROOT", "custom/bronze")
+    monkeypatch.setenv("L2_INGEST_NO_JSON_OUTPUT", "true")
+
+    args = cli.build_parser().parse_args(["loader-l2-m1"])
+
+    assert args.symbols == ["BTC", "ETH"]
+    assert args.levels == 25
+    assert args.snapshot_count == 5
+    assert args.poll_interval_s == 10.0
+    assert args.max_runtime_s == 55.0
+    assert args.save_parquet_lake is True
+    assert args.lake_root == "custom/bronze"
+    assert args.no_json_output is True
 
 
 def test_main_loader_saves_timescaledb_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -334,10 +363,13 @@ def test_main_loader_l2_m1_command_saves_parquet(monkeypatch: pytest.MonkeyPatch
         open_interest_last=1000.0,
         funding_8h_last=0.0001,
         current_funding_last=0.00001,
+        fetch_duration_s_mean=0.11,
+        fetch_duration_s_max=0.22,
+        fetch_duration_s_last=0.12,
     )
 
     monkeypatch.setattr(cli, "SingleInstanceLock", NoopLock)
-    monkeypatch.setattr(cli, "fetch_l2_snapshots", lambda **kwargs: [object()])
+    monkeypatch.setattr(cli, "fetch_l2_snapshots_for_symbols", lambda **kwargs: {"BTC": [object(), object()]})
     monkeypatch.setattr(cli, "aggregate_snapshots_to_m1", lambda snapshots: [row])
     monkeypatch.setattr(
         cli,
@@ -362,3 +394,62 @@ def test_main_loader_l2_m1_command_saves_parquet(monkeypatch: pytest.MonkeyPatch
 
     cli.main()
     assert captured["lake_root"] == "lake/bronze"
+
+
+def test_l2_minute_bar_stats_log_is_expressive(caplog: pytest.LogCaptureFixture) -> None:
+    row = L2MinuteBar(
+        minute_ts=datetime(2026, 4, 29, 10, 0, tzinfo=UTC),
+        exchange="deribit",
+        symbol="BTC-PERPETUAL",
+        snapshot_count=5,
+        mid_open=100.0,
+        mid_high=101.0,
+        mid_low=99.0,
+        mid_close=100.5,
+        mark_close=100.4,
+        index_close=100.3,
+        spread_bps_mean=10.0,
+        spread_bps_max=12.0,
+        spread_bps_last=11.0,
+        bid_depth_1_mean=10.0,
+        ask_depth_1_mean=11.0,
+        bid_depth_10_mean=100.0,
+        ask_depth_10_mean=110.0,
+        bid_depth_50_mean=500.0,
+        ask_depth_50_mean=510.0,
+        imbalance_1_mean=0.1,
+        imbalance_10_mean=0.2,
+        imbalance_50_mean=0.3,
+        imbalance_10_last=0.25,
+        imbalance_50_last=0.35,
+        microprice_close=100.45,
+        microprice_minus_mid_mean=0.01,
+        bid_vwap_10_mean=99.5,
+        ask_vwap_10_mean=101.5,
+        open_interest_last=1000.0,
+        funding_8h_last=0.0001,
+        current_funding_last=0.00001,
+        fetch_duration_s_mean=0.11,
+        fetch_duration_s_max=0.22,
+        fetch_duration_s_last=0.12,
+    )
+    logger = logging.getLogger("test_l2_stats_log")
+
+    with caplog.at_level(logging.INFO, logger="test_l2_stats_log"):
+        cli._log_l2_minute_bar_stats(
+            logger=logger,
+            row=row,
+            collected_snapshots=5,
+            requested_snapshots=5,
+        )
+
+    message = caplog.messages[0]
+    assert "L2 minute stats" in message
+    assert "symbol=BTC-PERPETUAL" in message
+    assert "snapshots_collected=5" in message
+    assert "mid_close=100.50000000" in message
+    assert "spread_bps_mean=10.00000000" in message
+    assert "open_interest_last=1000.00000000" in message
+    assert "fetch_duration_s_mean=0.110000" in message
+    assert "fetch_duration_s_max=0.220000" in message
+    assert "fetch_duration_s_last=0.120000" in message

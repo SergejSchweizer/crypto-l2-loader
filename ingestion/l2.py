@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from time import sleep
+from time import monotonic, sleep
 from typing import Any, TypedDict, cast
 
 from ingestion.exchanges.deribit_l2 import fetch_order_book_snapshot
+
+
+@dataclass(frozen=True)
+class L2FetchConfig:
+    """Runtime configuration for bounded L2 snapshot collection."""
+
+    exchange: str
+    symbols: list[str]
+    depth: int
+    snapshot_count: int
+    poll_interval_s: float
+    max_runtime_s: float | None = None
+    concurrency: int | None = None
 
 
 @dataclass(frozen=True)
@@ -23,6 +37,7 @@ class L2Snapshot:
             exchange="deribit",
             symbol="BTC-PERPETUAL",
             timestamp=datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+            fetch_duration_s=0.25,
             bids=[(100.0, 10.0)],
             asks=[(100.1, 9.0)],
             mark_price=100.05,
@@ -37,6 +52,7 @@ class L2Snapshot:
     exchange: str
     symbol: str
     timestamp: datetime
+    fetch_duration_s: float
     bids: list[tuple[float, float]]
     asks: list[tuple[float, float]]
     mark_price: float | None
@@ -81,6 +97,9 @@ class L2MinuteBar:
     open_interest_last: float | None
     funding_8h_last: float | None
     current_funding_last: float | None
+    fetch_duration_s_mean: float
+    fetch_duration_s_max: float
+    fetch_duration_s_last: float
 
 
 class SnapshotFeatures(TypedDict):
@@ -112,98 +131,291 @@ def fetch_l2_snapshots(
 ) -> list[L2Snapshot]:
     """Collect a finite sequence of L2 snapshots for one symbol."""
 
-    if exchange != "deribit":
-        raise ValueError(f"Unsupported exchange '{exchange}'")
-    if snapshot_count <= 0:
-        raise ValueError("snapshot_count must be positive")
-    if poll_interval_s < 0:
-        raise ValueError("poll_interval_s must be >= 0")
+    _validate_fetch_config(
+        L2FetchConfig(
+            exchange=exchange,
+            symbols=[symbol],
+            depth=depth,
+            snapshot_count=snapshot_count,
+            poll_interval_s=poll_interval_s,
+        )
+    )
 
     snapshots: list[L2Snapshot] = []
     for index in range(snapshot_count):
+        started_at = monotonic()
         raw = fetch_order_book_snapshot(symbol=symbol, depth=depth)
-        snapshots.append(_snapshot_from_raw(raw))
+        snapshots.append(_snapshot_from_raw(raw=raw, fetch_duration_s=monotonic() - started_at))
         if index < snapshot_count - 1 and poll_interval_s > 0:
             sleep(poll_interval_s)
     return snapshots
 
 
+def fetch_l2_snapshots_for_symbols(
+    exchange: str,
+    symbols: list[str],
+    depth: int,
+    snapshot_count: int,
+    poll_interval_s: float,
+    max_runtime_s: float | None = None,
+    concurrency: int | None = None,
+) -> dict[str, list[L2Snapshot]]:
+    """Collect L2 snapshots for all symbols using async polling ticks."""
+
+    config = L2FetchConfig(
+        exchange=exchange,
+        symbols=symbols,
+        depth=depth,
+        snapshot_count=snapshot_count,
+        poll_interval_s=poll_interval_s,
+        max_runtime_s=max_runtime_s,
+        concurrency=concurrency,
+    )
+    return asyncio.run(
+        fetch_l2_snapshots_for_symbols_async(
+            exchange=config.exchange,
+            symbols=config.symbols,
+            depth=config.depth,
+            snapshot_count=config.snapshot_count,
+            poll_interval_s=config.poll_interval_s,
+            max_runtime_s=config.max_runtime_s,
+            concurrency=config.concurrency,
+        )
+    )
+
+
+async def fetch_l2_snapshots_for_symbols_async(
+    exchange: str,
+    symbols: list[str],
+    depth: int,
+    snapshot_count: int,
+    poll_interval_s: float,
+    max_runtime_s: float | None = None,
+    concurrency: int | None = None,
+) -> dict[str, list[L2Snapshot]]:
+    """Collect L2 snapshots for all symbols concurrently on each polling tick.
+
+    This keeps total runtime bounded by polling cycles rather than multiplying
+    runtime by the number of symbols.
+    """
+
+    config = L2FetchConfig(
+        exchange=exchange,
+        symbols=symbols,
+        depth=depth,
+        snapshot_count=snapshot_count,
+        poll_interval_s=poll_interval_s,
+        max_runtime_s=max_runtime_s,
+        concurrency=concurrency,
+    )
+    _validate_fetch_config(config)
+
+    deadline = _deadline_from_config(config)
+    snapshots_by_symbol: dict[str, list[L2Snapshot]] = {symbol.upper(): [] for symbol in config.symbols}
+    semaphore = asyncio.Semaphore(max(1, config.concurrency or len(config.symbols)))
+
+    for index in range(config.snapshot_count):
+        if _deadline_reached(deadline):
+            break
+
+        tick_snapshots = await _collect_l2_tick(
+            symbols=config.symbols,
+            depth=config.depth,
+            deadline=deadline,
+            semaphore=semaphore,
+        )
+        _append_tick_snapshots(snapshots_by_symbol=snapshots_by_symbol, tick_snapshots=tick_snapshots)
+
+        if index >= config.snapshot_count - 1 or config.poll_interval_s <= 0:
+            continue
+
+        slept = await _sleep_between_ticks(poll_interval_s=config.poll_interval_s, deadline=deadline)
+        if not slept:
+            break
+
+    return snapshots_by_symbol
+
+
+def _validate_fetch_config(config: L2FetchConfig) -> None:
+    """Validate L2 fetch configuration before network calls begin."""
+
+    if config.exchange != "deribit":
+        raise ValueError(f"Unsupported exchange '{config.exchange}'")
+    if not config.symbols:
+        raise ValueError("symbols must not be empty")
+    if config.depth <= 0:
+        raise ValueError("depth must be positive")
+    if config.snapshot_count <= 0:
+        raise ValueError("snapshot_count must be positive")
+    if config.poll_interval_s < 0:
+        raise ValueError("poll_interval_s must be >= 0")
+    if config.max_runtime_s is not None and config.max_runtime_s <= 0:
+        raise ValueError("max_runtime_s must be positive when set")
+    if config.concurrency is not None and config.concurrency <= 0:
+        raise ValueError("concurrency must be positive when set")
+
+
+def _deadline_from_config(config: L2FetchConfig) -> float | None:
+    """Return monotonic deadline for a config, or ``None`` when disabled."""
+
+    if config.max_runtime_s is None:
+        return None
+    return monotonic() + config.max_runtime_s
+
+
+def _deadline_reached(deadline: float | None) -> bool:
+    """Return whether a monotonic deadline has expired."""
+
+    return deadline is not None and monotonic() >= deadline
+
+
+async def _collect_l2_tick(
+    symbols: list[str],
+    depth: int,
+    deadline: float | None,
+    semaphore: asyncio.Semaphore,
+) -> list[tuple[str, L2Snapshot]]:
+    """Fetch one concurrent polling tick for all symbols."""
+
+    tick_results = await asyncio.gather(
+        *[_fetch_l2_symbol(symbol=symbol, depth=depth, deadline=deadline, semaphore=semaphore) for symbol in symbols],
+        return_exceptions=True,
+    )
+    return [result for result in tick_results if not isinstance(result, BaseException) and result is not None]
+
+
+async def _fetch_l2_symbol(
+    symbol: str,
+    depth: int,
+    deadline: float | None,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, L2Snapshot] | None:
+    """Fetch and normalize one symbol snapshot inside a bounded async tick."""
+
+    async with semaphore:
+        if _deadline_reached(deadline):
+            return None
+        started_at = monotonic()
+        raw = await asyncio.to_thread(fetch_order_book_snapshot, symbol=symbol, depth=depth)
+        return symbol.upper(), _snapshot_from_raw(raw=raw, fetch_duration_s=monotonic() - started_at)
+
+
+def _append_tick_snapshots(
+    snapshots_by_symbol: dict[str, list[L2Snapshot]],
+    tick_snapshots: list[tuple[str, L2Snapshot]],
+) -> None:
+    """Append normalized tick snapshots into the per-symbol collection."""
+
+    for symbol_key, snapshot in tick_snapshots:
+        snapshots_by_symbol.setdefault(symbol_key, []).append(snapshot)
+
+
+async def _sleep_between_ticks(poll_interval_s: float, deadline: float | None) -> bool:
+    """Sleep between ticks, respecting deadline; return whether another tick may run."""
+
+    if deadline is None:
+        await asyncio.sleep(poll_interval_s)
+        return True
+
+    remaining_s = deadline - monotonic()
+    if remaining_s <= 0:
+        return False
+    await asyncio.sleep(min(poll_interval_s, remaining_s))
+    return not _deadline_reached(deadline)
+
+
 def aggregate_snapshots_to_m1(snapshots: list[L2Snapshot]) -> list[L2MinuteBar]:
     """Aggregate snapshots into M1 rows with unweighted means."""
 
+    grouped = _group_valid_snapshots_by_minute(snapshots)
+    return [_minute_bar_from_snapshots(key=key, snapshots=items) for key, items in sorted(grouped.items())]
+
+
+def _group_valid_snapshots_by_minute(
+    snapshots: list[L2Snapshot],
+) -> dict[tuple[str, str, datetime], list[L2Snapshot]]:
+    """Group valid non-crossed snapshots by exchange/symbol/minute."""
+
     grouped: dict[tuple[str, str, datetime], list[L2Snapshot]] = {}
     for snapshot in snapshots:
-        if not snapshot.bids or not snapshot.asks:
-            continue
-        best_bid = snapshot.bids[0][0]
-        best_ask = snapshot.asks[0][0]
-        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+        if not _is_valid_book_snapshot(snapshot):
             continue
         minute_ts = snapshot.timestamp.replace(second=0, microsecond=0)
         key = (snapshot.exchange, snapshot.symbol, minute_ts)
         grouped.setdefault(key, []).append(snapshot)
-
-    rows: list[L2MinuteBar] = []
-    for (exchange, symbol, minute_ts), minute_snaps in sorted(grouped.items(), key=lambda item: item[0][2]):
-        minute_snaps.sort(key=lambda item: item.timestamp)
-        stats: list[SnapshotFeatures] = [_snapshot_features(item) for item in minute_snaps]
-
-        mids = [item["mid"] for item in stats]
-        spreads = [item["spread_bps"] for item in stats]
-        bid_depth_1 = [item["bid_depth_1"] for item in stats]
-        ask_depth_1 = [item["ask_depth_1"] for item in stats]
-        bid_depth_10 = [item["bid_depth_10"] for item in stats]
-        ask_depth_10 = [item["ask_depth_10"] for item in stats]
-        bid_depth_50 = [item["bid_depth_50"] for item in stats]
-        ask_depth_50 = [item["ask_depth_50"] for item in stats]
-
-        imbalance_1 = [item["imbalance_1"] for item in stats if item["imbalance_1"] is not None]
-        imbalance_10 = [item["imbalance_10"] for item in stats if item["imbalance_10"] is not None]
-        imbalance_50 = [item["imbalance_50"] for item in stats if item["imbalance_50"] is not None]
-        micro_minus_mid = [item["microprice_minus_mid"] for item in stats if item["microprice_minus_mid"] is not None]
-        bid_vwap_10 = [item["bid_vwap_10"] for item in stats if item["bid_vwap_10"] is not None]
-        ask_vwap_10 = [item["ask_vwap_10"] for item in stats if item["ask_vwap_10"] is not None]
-
-        rows.append(
-            L2MinuteBar(
-                minute_ts=minute_ts,
-                exchange=exchange,
-                symbol=symbol,
-                snapshot_count=len(stats),
-                mid_open=mids[0],
-                mid_high=max(mids),
-                mid_low=min(mids),
-                mid_close=mids[-1],
-                mark_close=minute_snaps[-1].mark_price,
-                index_close=minute_snaps[-1].index_price,
-                spread_bps_mean=sum(spreads) / len(spreads),
-                spread_bps_max=max(spreads),
-                spread_bps_last=spreads[-1],
-                bid_depth_1_mean=sum(bid_depth_1) / len(bid_depth_1),
-                ask_depth_1_mean=sum(ask_depth_1) / len(ask_depth_1),
-                bid_depth_10_mean=sum(bid_depth_10) / len(bid_depth_10),
-                ask_depth_10_mean=sum(ask_depth_10) / len(ask_depth_10),
-                bid_depth_50_mean=sum(bid_depth_50) / len(bid_depth_50),
-                ask_depth_50_mean=sum(ask_depth_50) / len(ask_depth_50),
-                imbalance_1_mean=_mean_or_none(imbalance_1),
-                imbalance_10_mean=_mean_or_none(imbalance_10),
-                imbalance_50_mean=_mean_or_none(imbalance_50),
-                imbalance_10_last=stats[-1]["imbalance_10"],
-                imbalance_50_last=stats[-1]["imbalance_50"],
-                microprice_close=stats[-1]["microprice"],
-                microprice_minus_mid_mean=_mean_or_none(micro_minus_mid),
-                bid_vwap_10_mean=_mean_or_none(bid_vwap_10),
-                ask_vwap_10_mean=_mean_or_none(ask_vwap_10),
-                open_interest_last=minute_snaps[-1].open_interest,
-                funding_8h_last=minute_snaps[-1].funding_8h,
-                current_funding_last=minute_snaps[-1].current_funding,
-            )
-        )
-
-    return rows
+    return grouped
 
 
-def _snapshot_from_raw(raw: dict[str, object]) -> L2Snapshot:
+def _is_valid_book_snapshot(snapshot: L2Snapshot) -> bool:
+    """Return whether a snapshot has a usable non-crossed best book."""
+
+    if not snapshot.bids or not snapshot.asks:
+        return False
+    best_bid = snapshot.bids[0][0]
+    best_ask = snapshot.asks[0][0]
+    return best_bid > 0 and best_ask > 0 and best_bid < best_ask
+
+
+def _minute_bar_from_snapshots(
+    key: tuple[str, str, datetime],
+    snapshots: list[L2Snapshot],
+) -> L2MinuteBar:
+    """Aggregate one grouped minute of snapshots into an M1 feature row."""
+
+    exchange, symbol, minute_ts = key
+    ordered_snapshots = sorted(snapshots, key=lambda item: item.timestamp)
+    stats = [_snapshot_features(item) for item in ordered_snapshots]
+    last_snapshot = ordered_snapshots[-1]
+    fetch_durations = [item.fetch_duration_s for item in ordered_snapshots]
+
+    mids = _feature_values(stats, "mid")
+    spreads = _feature_values(stats, "spread_bps")
+    bid_depth_1 = _feature_values(stats, "bid_depth_1")
+    ask_depth_1 = _feature_values(stats, "ask_depth_1")
+    bid_depth_10 = _feature_values(stats, "bid_depth_10")
+    ask_depth_10 = _feature_values(stats, "ask_depth_10")
+    bid_depth_50 = _feature_values(stats, "bid_depth_50")
+    ask_depth_50 = _feature_values(stats, "ask_depth_50")
+
+    return L2MinuteBar(
+        minute_ts=minute_ts,
+        exchange=exchange,
+        symbol=symbol,
+        snapshot_count=len(stats),
+        mid_open=mids[0],
+        mid_high=max(mids),
+        mid_low=min(mids),
+        mid_close=mids[-1],
+        mark_close=last_snapshot.mark_price,
+        index_close=last_snapshot.index_price,
+        spread_bps_mean=_mean(spreads),
+        spread_bps_max=max(spreads),
+        spread_bps_last=spreads[-1],
+        bid_depth_1_mean=_mean(bid_depth_1),
+        ask_depth_1_mean=_mean(ask_depth_1),
+        bid_depth_10_mean=_mean(bid_depth_10),
+        ask_depth_10_mean=_mean(ask_depth_10),
+        bid_depth_50_mean=_mean(bid_depth_50),
+        ask_depth_50_mean=_mean(ask_depth_50),
+        imbalance_1_mean=_mean_or_none(_optional_feature_values(stats, "imbalance_1")),
+        imbalance_10_mean=_mean_or_none(_optional_feature_values(stats, "imbalance_10")),
+        imbalance_50_mean=_mean_or_none(_optional_feature_values(stats, "imbalance_50")),
+        imbalance_10_last=stats[-1]["imbalance_10"],
+        imbalance_50_last=stats[-1]["imbalance_50"],
+        microprice_close=stats[-1]["microprice"],
+        microprice_minus_mid_mean=_mean_or_none(_optional_feature_values(stats, "microprice_minus_mid")),
+        bid_vwap_10_mean=_mean_or_none(_optional_feature_values(stats, "bid_vwap_10")),
+        ask_vwap_10_mean=_mean_or_none(_optional_feature_values(stats, "ask_vwap_10")),
+        open_interest_last=last_snapshot.open_interest,
+        funding_8h_last=last_snapshot.funding_8h,
+        current_funding_last=last_snapshot.current_funding,
+        fetch_duration_s_mean=_mean(fetch_durations),
+        fetch_duration_s_max=max(fetch_durations),
+        fetch_duration_s_last=fetch_durations[-1],
+    )
+
+
+def _snapshot_from_raw(raw: dict[str, object], fetch_duration_s: float = 0.0) -> L2Snapshot:
     """Convert normalized adapter payload into ``L2Snapshot``."""
 
     timestamp_ms = int(cast(int | float, raw["timestamp_ms"]))
@@ -215,6 +427,7 @@ def _snapshot_from_raw(raw: dict[str, object]) -> L2Snapshot:
         exchange=str(raw["exchange"]),
         symbol=str(raw["symbol"]),
         timestamp=timestamp,
+        fetch_duration_s=fetch_duration_s,
         bids=bids,
         asks=asks,
         mark_price=_optional_float(raw.get("mark_price")),
@@ -301,7 +514,30 @@ def _mean_or_none(values: list[float]) -> float | None:
 
     if not values:
         return None
+    return _mean(values)
+
+
+def _mean(values: list[float]) -> float:
+    """Return arithmetic mean of a non-empty list."""
+
     return sum(values) / len(values)
+
+
+def _feature_values(stats: list[SnapshotFeatures], key: str) -> list[float]:
+    """Return required numeric values for one snapshot feature."""
+
+    return [float(cast(int | float, cast(dict[str, object], item)[key])) for item in stats]
+
+
+def _optional_feature_values(stats: list[SnapshotFeatures], key: str) -> list[float]:
+    """Return present numeric values for one optional snapshot feature."""
+
+    values: list[float] = []
+    for item in stats:
+        value = cast(dict[str, object], item)[key]
+        if value is not None:
+            values.append(float(cast(int | float, value)))
+    return values
 
 
 def l2_m1_record(row: L2MinuteBar, run_id: str, ingested_at: datetime) -> dict[str, object]:
@@ -348,6 +584,9 @@ def l2_m1_record(row: L2MinuteBar, run_id: str, ingested_at: datetime) -> dict[s
         "open_interest_last": row.open_interest_last,
         "funding_8h_last": row.funding_8h_last,
         "current_funding_last": row.current_funding_last,
+        "fetch_duration_s_mean": row.fetch_duration_s_mean,
+        "fetch_duration_s_max": row.fetch_duration_s_max,
+        "fetch_duration_s_last": row.fetch_duration_s_last,
     }
 
 
@@ -404,6 +643,9 @@ def load_l2_m1_from_rows(rows: list[dict[str, Any]]) -> list[L2MinuteBar]:
                 open_interest_last=_optional_float(item.get("open_interest_last")),
                 funding_8h_last=_optional_float(item.get("funding_8h_last")),
                 current_funding_last=_optional_float(item.get("current_funding_last")),
+                fetch_duration_s_mean=float(item.get("fetch_duration_s_mean", 0.0)),
+                fetch_duration_s_max=float(item.get("fetch_duration_s_max", 0.0)),
+                fetch_duration_s_last=float(item.get("fetch_duration_s_last", 0.0)),
             )
         )
     return sorted(output, key=lambda item: (item.minute_ts, item.exchange, item.symbol))
