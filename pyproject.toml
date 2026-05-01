@@ -9,10 +9,14 @@ description = "Framework for crypto L2 and market data ingestion"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "pytest>=8.0.0",
-  "ruff>=0.6.0",
-  "mypy>=1.10.0",
-  "pyarrow>=16.0.0",
+  "pyarrow>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.20.2",
+  "pytest>=9.0.3",
+  "ruff>=0.15.12",
 ]
 
 [tool.setuptools.packages.find]

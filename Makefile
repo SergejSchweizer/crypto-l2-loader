@@ -5,7 +5,7 @@ PYTHON ?= .venv/bin/python
 setup:
 	python3 -m venv .venv
 	$(PYTHON) -m pip install -U pip
-	$(PYTHON) -m pip install -e .
+	$(PYTHON) -m pip install -e ".[dev]"
 
 test:
 	$(PYTHON) -m pytest

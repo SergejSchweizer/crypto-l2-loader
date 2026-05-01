@@ -63,8 +63,10 @@ AGENTS.md
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-pip install -e .
+pip install -e ".[dev]"
 ```
+
+For runtime-only installs, use `pip install -e .`. The `dev` extra installs the pinned quality-gate tools used by `make check`.
 
 ## Configuration
 
